@@ -1,0 +1,26 @@
+{
+  "name": "chat-app-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Polling-based chat API. See /ARCHITECTURE.md and /ROADMAP.md at the repo root.",
+  "scripts": {
+    "migrate:up": "node-pg-migrate up --envPath .env",
+    "migrate:down": "node-pg-migrate down --envPath .env",
+    "migrate:create": "node-pg-migrate create --envPath .env",
+    "seed": "tsx src/db/seed.ts",
+    "typecheck": "tsc --noEmit",
+    "db:up": "docker compose up -d",
+    "db:down": "docker compose down"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "pg": "^8.22.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.2",
+    "@types/pg": "^8.20.0",
+    "node-pg-migrate": "^9.0.0",
+    "tsx": "^4.23.1",
+    "typescript": "^6.0.3"
+  }
+}
