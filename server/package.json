@@ -4,6 +4,7 @@
   "private": true,
   "description": "Polling-based chat API. See /ARCHITECTURE.md and /ROADMAP.md at the repo root.",
   "scripts": {
+    "dev": "tsx watch src/index.ts",
     "migrate:up": "node-pg-migrate up --envPath .env",
     "migrate:down": "node-pg-migrate down --envPath .env",
     "migrate:create": "node-pg-migrate create --envPath .env",
@@ -13,10 +14,17 @@
     "db:down": "docker compose down"
   },
   "dependencies": {
+    "bcrypt": "^6.0.0",
     "dotenv": "^17.4.2",
-    "pg": "^8.22.0"
+    "express": "^5.2.1",
+    "jsonwebtoken": "^9.0.3",
+    "pg": "^8.22.0",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@types/bcrypt": "^6.0.0",
+    "@types/express": "^5.0.6",
+    "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^26.1.2",
     "@types/pg": "^8.20.0",
     "node-pg-migrate": "^9.0.0",
