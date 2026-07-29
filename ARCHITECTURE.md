@@ -107,7 +107,7 @@ CREATE TABLE messages (
 CREATE INDEX idx_messages_room_seq ON messages (room_id, sequence_number);
 
 CREATE TABLE refresh_tokens (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  id UUID PRIMARY KEY,               -- app-supplied via crypto.randomUUID(), no DB extension needed
   user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   family_id UUID NOT NULL,          -- shared by every token descended from one login
   token_hash TEXT NOT NULL,         -- sha256 of the opaque token; raw token never stored
