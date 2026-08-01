@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { hashPassword, verifyPassword } from './password';
+import { hashPassword, verifyPasswordOrDummy } from './password';
 import { signAccessToken } from './tokens';
 import { createUser, findUserByEmail } from '../db/users.repo';
 import { ValidationError, AuthError, ConflictError } from '../errors';
@@ -59,9 +59,12 @@ authRouter.post('/login', async (req, res, next) => {
     const { email, password } = parsed.data;
 
     const user = await findUserByEmail(email);
-    // Same error for "no such user" and "wrong password" — don't let this
-    // endpoint be used to discover which emails are registered.
-    if (!user || !(await verifyPassword(password, user.password_hash))) {
+    // verifyPasswordOrDummy always runs a bcrypt.compare, even when `user`
+    // is undefined — that's what makes "same error for no-such-user and
+    // wrong-password" actually true in wall-clock time, not just in the
+    // response body. See password.ts for why that distinction matters.
+    const passwordValid = await verifyPasswordOrDummy(password, user?.password_hash);
+    if (!user || !passwordValid) {
       throw new AuthError('Invalid email or password');
     }
 
