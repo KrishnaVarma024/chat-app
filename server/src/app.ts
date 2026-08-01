@@ -1,4 +1,5 @@
 import express from 'express';
+import cookieParser from 'cookie-parser';
 import { authRouter } from './auth/auth.routes';
 import { usersRouter } from './users/users.routes';
 import { errorHandler } from './errors';
@@ -6,6 +7,10 @@ import { errorHandler } from './errors';
 export function createApp() {
   const app = express();
   app.use(express.json());
+  // Only used to read the refresh_token cookie back in /auth/refresh and
+  // /auth/logout — no signing secret needed since we're not trusting the
+  // cookie's contents directly, only using it as a lookup key into the DB.
+  app.use(cookieParser());
 
   app.get('/health', (_req, res) => res.json({ ok: true }));
 

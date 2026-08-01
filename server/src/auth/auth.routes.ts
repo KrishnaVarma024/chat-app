@@ -2,7 +2,14 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { hashPassword, verifyPasswordOrDummy } from './password';
 import { signAccessToken } from './tokens';
+import { REFRESH_COOKIE_NAME } from './refresh-tokens';
+import { setRefreshCookie, clearRefreshCookie } from './refresh-cookie';
 import { createUser, findUserByEmail } from '../db/users.repo';
+import {
+  createRefreshTokenFamily,
+  revokeRefreshToken,
+  rotateRefreshToken,
+} from '../db/refresh-tokens.repo';
 import { ValidationError, AuthError, ConflictError } from '../errors';
 
 export const authRouter = Router();
@@ -36,6 +43,9 @@ authRouter.post('/register', async (req, res, next) => {
     }
 
     const accessToken = signAccessToken({ sub: user.id });
+    const refreshToken = await createRefreshTokenFamily(user.id);
+    setRefreshCookie(res, refreshToken);
+
     res.status(201).json({
       user: { id: user.id, username: user.username, email: user.email },
       accessToken,
@@ -69,10 +79,52 @@ authRouter.post('/login', async (req, res, next) => {
     }
 
     const accessToken = signAccessToken({ sub: user.id });
+    const refreshToken = await createRefreshTokenFamily(user.id);
+    setRefreshCookie(res, refreshToken);
+
     res.status(200).json({
       user: { id: user.id, username: user.username, email: user.email },
       accessToken,
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+authRouter.post('/refresh', async (req, res, next) => {
+  try {
+    const rawToken: string | undefined = req.cookies?.[REFRESH_COOKIE_NAME];
+    if (!rawToken) {
+      throw new AuthError('Missing refresh token');
+    }
+
+    const result = await rotateRefreshToken(rawToken);
+
+    if (result.kind === 'reuse') {
+      clearRefreshCookie(res);
+      throw new AuthError('Refresh token reuse detected; all sessions from this login have been revoked');
+    }
+    if (result.kind === 'invalid') {
+      clearRefreshCookie(res);
+      throw new AuthError('Invalid or expired refresh token');
+    }
+
+    setRefreshCookie(res, result.rawToken);
+    const accessToken = signAccessToken({ sub: result.userId });
+    res.status(200).json({ accessToken });
+  } catch (err) {
+    next(err);
+  }
+});
+
+authRouter.post('/logout', async (req, res, next) => {
+  try {
+    const rawToken: string | undefined = req.cookies?.[REFRESH_COOKIE_NAME];
+    if (rawToken) {
+      await revokeRefreshToken(rawToken);
+    }
+    clearRefreshCookie(res);
+    res.status(204).send();
   } catch (err) {
     next(err);
   }
