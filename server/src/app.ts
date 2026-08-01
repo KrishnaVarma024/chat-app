@@ -2,6 +2,7 @@ import express from 'express';
 import cookieParser from 'cookie-parser';
 import { authRouter } from './auth/auth.routes';
 import { usersRouter } from './users/users.routes';
+import { roomsRouter } from './rooms/rooms.routes';
 import { errorHandler } from './errors';
 
 export function createApp() {
@@ -16,6 +17,7 @@ export function createApp() {
 
   app.use('/auth', authRouter);
   app.use('/users', usersRouter);
+  app.use('/rooms', roomsRouter);
 
   // Must be registered last — Express identifies error-handling middleware
   // by its four-argument signature and only calls it when next(err) fires.

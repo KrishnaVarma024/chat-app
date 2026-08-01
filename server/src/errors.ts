@@ -34,6 +34,23 @@ export class ConflictError extends AppError {
   }
 }
 
+/** "I know who you are, but you're not allowed to do this" — distinct from
+ * AuthError (401, "I don't know who you are"). Phase 1/2 never needed this
+ * because every protected route only ever asked "are you logged in", never
+ * "are you allowed to touch this specific resource." Room membership is the
+ * first place that second question shows up. */
+export class ForbiddenError extends AppError {
+  constructor(message = 'Forbidden') {
+    super(403, 'FORBIDDEN', message);
+  }
+}
+
+export class NotFoundError extends AppError {
+  constructor(message = 'Not found') {
+    super(404, 'NOT_FOUND', message);
+  }
+}
+
 export function errorHandler(err: unknown, _req: Request, res: Response, _next: NextFunction) {
   if (err instanceof AppError) {
     return res.status(err.statusCode).json({ error: { code: err.code, message: err.message } });
