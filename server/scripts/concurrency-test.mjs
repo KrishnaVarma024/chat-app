@@ -20,6 +20,14 @@ import 'dotenv/config';
 import { randomUUID } from 'node:crypto';
 import pg from 'pg';
 
+// Same fix as src/db/pool.ts, applied here too: this script opens its own
+// separate pg.Client in a separate Node process, so pool.ts's type-parser
+// registration (process-wide, but only within the *server's* process) never
+// reaches it. Without this, BIGINT columns (sequence_number) come back as
+// strings ("1", "2"...) instead of numbers, and the contiguity check below
+// would fail on a type mismatch even when the actual data is correct.
+pg.types.setTypeParser(20, (value) => parseInt(value, 10));
+
 const BASE_URL = process.env.API_URL ?? `http://localhost:${process.env.PORT ?? 4000}`;
 const COUNT = Number(process.argv[2] ?? 50);
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -116,7 +124,7 @@ async function main() {
   const { rows: countRows } = await client.query('SELECT count(*) FROM messages WHERE room_id = $1', [room.id]);
   await client.end();
 
-  const sameSequence = retryBody.sequenceNumber === retryTarget.sequence_number || retryBody.sequence_number === retryTarget.sequence_number;
+  const sameSequence = retryBody.sequence_number === retryTarget.sequence_number;
   const rowCountUnchanged = Number(countRows[0].count) === COUNT;
 
   console.log(`Idempotent retry returned original sequence_number (${retryTarget.sequence_number}): ${sameSequence}`);
