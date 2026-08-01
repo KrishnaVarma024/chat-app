@@ -9,6 +9,7 @@ import {
   addRoomMember,
   removeRoomMember,
 } from '../db/rooms.repo';
+import { sendMessage } from '../db/messages.repo';
 import { ValidationError, NotFoundError } from '../errors';
 
 export const roomsRouter = Router();
@@ -78,3 +79,36 @@ roomsRouter.post('/:roomId/leave', requireRoomMembership, async (req: RoomScoped
     next(err);
   }
 });
+
+const sendMessageSchema = z.object({
+  body: z.string().min(1).max(4000),
+  // Client-generated — this is the idempotency key, see messages.repo.ts.
+  clientMessageId: z.string().uuid(),
+});
+
+roomsRouter.post(
+  '/:roomId/messages',
+  requireRoomMembership,
+  async (req: RoomScopedRequest, res, next) => {
+    try {
+      const parsed = sendMessageSchema.safeParse(req.body);
+      if (!parsed.success) {
+        throw new ValidationError(parsed.error.issues[0]?.message ?? 'Invalid input');
+      }
+
+      const message = await sendMessage({
+        roomId: req.roomId!,
+        senderId: req.user!.id,
+        clientMessageId: parsed.data.clientMessageId,
+        body: parsed.data.body,
+      });
+
+      // Always 201, whether this call created the message or just confirmed
+      // an already-sent one — the client shouldn't have to branch on status
+      // code to know "my message exists now," which is true either way.
+      res.status(201).json(message);
+    } catch (err) {
+      next(err);
+    }
+  }
+);
