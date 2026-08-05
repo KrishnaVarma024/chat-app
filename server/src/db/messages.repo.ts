@@ -76,3 +76,90 @@ export async function sendMessage(params: {
     client.release();
   }
 }
+
+export const DEFAULT_PAGE_LIMIT = 50;
+export const MAX_PAGE_LIMIT = 100;
+
+export interface ListMessagesResult {
+  messages: MessageRow[];
+  hasMore: boolean;
+}
+
+/**
+ * Poll direction: everything strictly after a cursor, oldest first — the
+ * order a client wants to append new messages to a chat log. Fetches
+ * limit+1 rows so `hasMore` can be answered without a second COUNT query;
+ * the (limit+1)th row is only ever used to set the flag, never returned.
+ * Correctness note: because sequence_number is assigned once and never
+ * reused or rewritten (see sendMessage above), this WHERE clause is stable
+ * under concurrent inserts — new messages only ever get sequence numbers
+ * *greater* than anything already returned, so they can never retroactively
+ * appear inside, or shift, a page that's already been served.
+ */
+export async function listMessagesAfter(
+  roomId: number,
+  afterSeq: number,
+  limit: number = DEFAULT_PAGE_LIMIT
+): Promise<ListMessagesResult> {
+  const result = await pool.query<MessageRow>(
+    `SELECT * FROM messages
+     WHERE room_id = $1 AND sequence_number > $2
+     ORDER BY sequence_number ASC
+     LIMIT $3`,
+    [roomId, afterSeq, limit + 1]
+  );
+  const hasMore = result.rows.length > limit;
+  return { messages: result.rows.slice(0, limit), hasMore };
+}
+
+/**
+ * Scrollback direction: everything strictly before a cursor, returned in
+ * descending order (so LIMIT keeps the *nearest* history to the cursor,
+ * not the oldest messages in the whole room) then reversed back to
+ * ascending for rendering. `beforeSeq === null` means "no lower bound yet"
+ * — the very first page a client loads when it opens a room, which is
+ * just "give me the most recent messages," i.e. scrollback with an
+ * effectively infinite starting cursor.
+ */
+export async function listMessagesBefore(
+  roomId: number,
+  beforeSeq: number | null,
+  limit: number = DEFAULT_PAGE_LIMIT
+): Promise<ListMessagesResult> {
+  const result =
+    beforeSeq === null
+      ? await pool.query<MessageRow>(
+          `SELECT * FROM messages
+           WHERE room_id = $1
+           ORDER BY sequence_number DESC
+           LIMIT $2`,
+          [roomId, limit + 1]
+        )
+      : await pool.query<MessageRow>(
+          `SELECT * FROM messages
+           WHERE room_id = $1 AND sequence_number < $2
+           ORDER BY sequence_number DESC
+           LIMIT $3`,
+          [roomId, beforeSeq, limit + 1]
+        );
+
+  const hasMore = result.rows.length > limit;
+  const page = result.rows.slice(0, limit);
+  page.reverse();
+  return { messages: page, hasMore };
+}
+
+/** The room's current position, independent of pagination direction — this
+ * is what lets a client tell "I've rendered everything" apart from "I hit
+ * this page's limit but there's more." Reads room_sequence_counters rather
+ * than MAX(messages.sequence_number): it's the same value, already
+ * maintained atomically on every send, and an indexed point lookup instead
+ * of a scan. Returns 0 for a room that has never had a message sent to it
+ * (no counter row exists yet — see sendMessage's lazy INSERT ON CONFLICT). */
+export async function getLatestSequenceNumber(roomId: number): Promise<number> {
+  const result = await pool.query<{ last_sequence: number }>(
+    `SELECT last_sequence FROM room_sequence_counters WHERE room_id = $1`,
+    [roomId]
+  );
+  return result.rows[0]?.last_sequence ?? 0;
+}
