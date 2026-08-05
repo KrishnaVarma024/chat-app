@@ -12,7 +12,8 @@
     "typecheck": "tsc --noEmit",
     "db:up": "docker compose up -d",
     "db:down": "docker compose down",
-    "test:concurrency": "node scripts/concurrency-test.mjs"
+    "test:concurrency": "node scripts/concurrency-test.mjs",
+    "test:scrollback-stability": "node scripts/scrollback-stability-test.mjs"
   },
   "dependencies": {
     "bcrypt": "^6.0.0",
