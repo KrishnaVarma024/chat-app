@@ -48,18 +48,20 @@ export async function sendMessage(params: {
     const insertResult = await client.query<MessageRow>(
       `INSERT INTO messages (room_id, sender_id, sequence_number, client_message_id, body)
        VALUES ($1, $2, $3, $4, $5)
-       ON CONFLICT (room_id, client_message_id) DO NOTHING
+       ON CONFLICT (room_id, sender_id, client_message_id) DO NOTHING
        RETURNING *`,
       [params.roomId, params.senderId, sequenceNumber, params.clientMessageId, params.body]
     );
 
     if (insertResult.rows.length === 0) {
-      // client_message_id already exists for this room — this is a retry,
-      // not a new message. Fetch and return the original instead of
-      // erroring or silently creating a duplicate.
+      // THIS SENDER already used this client_message_id in this room — a
+      // retry, not a new message. Scoped by sender_id (not just room_id)
+      // so one user can never collide with another user's idempotency key.
+      // Fetch and return the original instead of erroring or silently
+      // creating a duplicate.
       const existing = await client.query<MessageRow>(
-        `SELECT * FROM messages WHERE room_id = $1 AND client_message_id = $2`,
-        [params.roomId, params.clientMessageId]
+        `SELECT * FROM messages WHERE room_id = $1 AND sender_id = $2 AND client_message_id = $3`,
+        [params.roomId, params.senderId, params.clientMessageId]
       );
       await client.query('COMMIT'); // the sequence-number claim above stands regardless
       return existing.rows[0];
