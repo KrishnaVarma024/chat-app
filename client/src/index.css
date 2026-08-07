@@ -1,0 +1,258 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: #f4f5f7;
+  color: #1a1a1a;
+}
+
+#root {
+  height: 100vh;
+}
+
+button {
+  cursor: pointer;
+  border: none;
+  border-radius: 6px;
+  background: #2563eb;
+  color: white;
+  padding: 0.5rem 1rem;
+  font-size: 0.9rem;
+}
+
+button:disabled {
+  background: #9ca3af;
+  cursor: not-allowed;
+}
+
+input {
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  padding: 0.5rem 0.75rem;
+  font-size: 0.9rem;
+}
+
+a {
+  color: #2563eb;
+}
+
+.form-error {
+  color: #dc2626;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  padding: 0.5rem 0.75rem;
+  border-radius: 6px;
+  font-size: 0.85rem;
+}
+
+/* ---- Auth screens ---- */
+
+.auth-page {
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.auth-form {
+  background: white;
+  padding: 2rem;
+  border-radius: 10px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+  width: 320px;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.auth-form h1 {
+  margin: 0 0 0.5rem;
+  font-size: 1.4rem;
+}
+
+.auth-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.85rem;
+  color: #4b5563;
+}
+
+.auth-switch {
+  font-size: 0.85rem;
+  text-align: center;
+  margin-top: 0.5rem;
+}
+
+.boot-screen {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: #6b7280;
+}
+
+/* ---- Shared page header ---- */
+
+.page-header {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 1rem 1.5rem;
+  background: white;
+  border-bottom: 1px solid #e5e7eb;
+}
+
+.page-header h1 {
+  font-size: 1.1rem;
+  margin: 0;
+  flex: 1;
+}
+
+.page-header-right {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  font-size: 0.9rem;
+  margin-left: auto;
+}
+
+.room-id {
+  color: #9ca3af;
+  font-size: 0.8rem;
+}
+
+/* ---- Room list ---- */
+
+.room-list-page {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.room-actions {
+  display: flex;
+  gap: 1rem;
+  padding: 1rem 1.5rem;
+  flex-wrap: wrap;
+}
+
+.room-actions form {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.room-list {
+  list-style: none;
+  margin: 0;
+  padding: 0 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.room-list li {
+  background: white;
+  border-radius: 8px;
+  padding: 0.75rem 1rem;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+}
+
+.room-list a {
+  text-decoration: none;
+  color: #1a1a1a;
+  display: flex;
+  justify-content: space-between;
+}
+
+.empty-state {
+  padding: 0 1.5rem;
+  color: #6b7280;
+}
+
+/* ---- Chat room ---- */
+
+.chat-room-page {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.message-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 1rem 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.loading-older,
+.history-start {
+  text-align: center;
+  color: #9ca3af;
+  font-size: 0.8rem;
+  margin: 0.25rem 0;
+}
+
+.message-item {
+  max-width: 60%;
+  background: white;
+  border-radius: 10px;
+  padding: 0.5rem 0.75rem;
+  align-self: flex-start;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+}
+
+.message-item.own {
+  align-self: flex-end;
+  background: #dbeafe;
+}
+
+.message-item.optimistic-pending {
+  opacity: 0.6;
+}
+
+.message-item.optimistic-failed {
+  background: #fee2e2;
+}
+
+.message-meta {
+  display: flex;
+  gap: 0.5rem;
+  font-size: 0.75rem;
+  color: #6b7280;
+  margin-bottom: 0.15rem;
+}
+
+.message-body {
+  font-size: 0.95rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.message-status {
+  display: block;
+  font-size: 0.7rem;
+  color: #9ca3af;
+  margin-top: 0.15rem;
+}
+
+.message-status.failed {
+  color: #dc2626;
+}
+
+.message-input {
+  display: flex;
+  gap: 0.5rem;
+  padding: 1rem 1.5rem;
+  background: white;
+  border-top: 1px solid #e5e7eb;
+}
+
+.message-input input {
+  flex: 1;
+}

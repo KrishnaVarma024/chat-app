@@ -10,6 +10,17 @@ export interface MessageRow {
   created_at: Date;
 }
 
+// Only the two list/read paths join in the sender's username — added for
+// Phase 6, so the chat UI can render "who sent this" for messages from
+// OTHER users. sendMessage's own INSERT...RETURNING deliberately stays a
+// plain MessageRow: the sender of a message they just sent always already
+// knows their own username from their own auth session, so there's no
+// reason to pay for a join on the write path just to hand back a value
+// the caller already has.
+export interface MessageWithSender extends MessageRow {
+  sender_username: string;
+}
+
 /**
  * Sends a message with a gap-free, per-room sequence number, atomically,
  * and de-duplicates retries by client_message_id. See ARCHITECTURE.md §6.
@@ -81,7 +92,7 @@ export const DEFAULT_PAGE_LIMIT = 50;
 export const MAX_PAGE_LIMIT = 100;
 
 export interface ListMessagesResult {
-  messages: MessageRow[];
+  messages: MessageWithSender[];
   hasMore: boolean;
 }
 
@@ -101,10 +112,12 @@ export async function listMessagesAfter(
   afterSeq: number,
   limit: number = DEFAULT_PAGE_LIMIT
 ): Promise<ListMessagesResult> {
-  const result = await pool.query<MessageRow>(
-    `SELECT * FROM messages
-     WHERE room_id = $1 AND sequence_number > $2
-     ORDER BY sequence_number ASC
+  const result = await pool.query<MessageWithSender>(
+    `SELECT m.*, u.username AS sender_username
+     FROM messages m
+     JOIN users u ON u.id = m.sender_id
+     WHERE m.room_id = $1 AND m.sequence_number > $2
+     ORDER BY m.sequence_number ASC
      LIMIT $3`,
     [roomId, afterSeq, limit + 1]
   );
@@ -128,17 +141,21 @@ export async function listMessagesBefore(
 ): Promise<ListMessagesResult> {
   const result =
     beforeSeq === null
-      ? await pool.query<MessageRow>(
-          `SELECT * FROM messages
-           WHERE room_id = $1
-           ORDER BY sequence_number DESC
+      ? await pool.query<MessageWithSender>(
+          `SELECT m.*, u.username AS sender_username
+           FROM messages m
+           JOIN users u ON u.id = m.sender_id
+           WHERE m.room_id = $1
+           ORDER BY m.sequence_number DESC
            LIMIT $2`,
           [roomId, limit + 1]
         )
-      : await pool.query<MessageRow>(
-          `SELECT * FROM messages
-           WHERE room_id = $1 AND sequence_number < $2
-           ORDER BY sequence_number DESC
+      : await pool.query<MessageWithSender>(
+          `SELECT m.*, u.username AS sender_username
+           FROM messages m
+           JOIN users u ON u.id = m.sender_id
+           WHERE m.room_id = $1 AND m.sequence_number < $2
+           ORDER BY m.sequence_number DESC
            LIMIT $3`,
           [roomId, beforeSeq, limit + 1]
         );
