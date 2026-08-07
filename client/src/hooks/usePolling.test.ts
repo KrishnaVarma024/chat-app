@@ -104,4 +104,35 @@ describe('usePolling', () => {
     await vi.advanceTimersByTimeAsync(10000);
     expect(onPoll).not.toHaveBeenCalled();
   });
+
+  // Phase 6 exercise M1 — hand-traced schedule for base=3000, max=15000,
+  // multiplier=3, all polls empty, first 20 seconds:
+  //   t=0      call 1 -> interval becomes min(3000*3, 15000)  =  9000
+  //   t=9000   call 2 -> interval becomes min(9000*3, 15000)  = 15000 (capped)
+  //   t=24000  call 3 (outside the 20s window we're checking)
+  // So exactly 2 calls land inside [0, 20000). This test exists to check
+  // the hand trace against the actual code, not the other way around —
+  // if these ever disagreed, the code would win and the trace would be
+  // the thing that was wrong.
+  it('M1 — matches the hand-traced schedule for base=3000/max=15000/x3 over 20s', async () => {
+    const onPoll = vi.fn().mockResolvedValue(false);
+    renderHook(() =>
+      usePolling({ baseIntervalMs: 3000, maxIntervalMs: 15000, backoffMultiplier: 3, onPoll, enabled: true })
+    );
+
+    expect(onPoll).toHaveBeenCalledTimes(1); // t=0
+
+    await vi.advanceTimersByTimeAsync(8999); // just before t=9000
+    expect(onPoll).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1); // t=9000
+    expect(onPoll).toHaveBeenCalledTimes(2);
+
+    await vi.advanceTimersByTimeAsync(10999); // t=19999 — still inside the 20s window, no 3rd call yet
+    expect(onPoll).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(1); // t=20000
+    expect(onPoll).toHaveBeenCalledTimes(2); // confirms exactly 2, not 3, inside [0, 20000)
+
+    await vi.advanceTimersByTimeAsync(4000); // t=24000 -> the 3rd call, just to confirm the trace's "next" prediction too
+    expect(onPoll).toHaveBeenCalledTimes(3);
+  });
 });
