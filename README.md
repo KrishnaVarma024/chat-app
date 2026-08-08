@@ -5,21 +5,27 @@ messaging-delivery correctness rather than CRUD breadth: gap-free
 per-room sequence numbers, cursor/keyset pagination, and JWT
 refresh-token rotation with reuse detection.
 
+**Live demo:** [chat-app-client-j5j9.onrender.com](https://chat-app-client-j5j9.onrender.com)
+(API: [chat-app-server-j0mr.onrender.com](https://chat-app-server-j0mr.onrender.com)/health)
+— register your own account, it's a real deploy, not a screenshot. Free-tier
+hosting, so the API cold-starts (~50s) if it's been idle; that's expected,
+not a bug. See [`DEPLOYMENT.md`](./DEPLOYMENT.md) for how it's deployed.
+
 See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the system design and
 [`ROADMAP.md`](./ROADMAP.md) for the build plan.
 
 ## Status
 
-Phases 0–7 complete: schema, register/login, refresh-token rotation with
-reuse detection, rooms & membership, atomic sequenced/idempotent message
-send, cursor pagination (poll + scrollback), the React frontend (auth,
-room list, polling chat view, infinite scroll, optimistic send), and
+All 8 phases complete and deployed: schema, register/login, refresh-token
+rotation with reuse detection, rooms & membership, atomic sequenced/idempotent
+message send, cursor pagination (poll + scrollback), the React frontend
+(auth, room list, polling chat view, infinite scroll, optimistic send),
 hardening (per-user token-bucket rate limiting on send/poll, request-id
 propagated through every log line for a request, a centralized error
 handler with a consistent `{ error: { code, message } }` shape, and zod
-input validation on every route). Phase 8 (automated tests + docs) is
-done; deployment is the remaining piece — see `ROADMAP.md` for the full
-plan and each phase's definition of done.
+input validation on every route), an automated integration test suite, and
+a live deploy (Postgres + API + static frontend). See `ROADMAP.md` for each
+phase's definition of done.
 
 ## Testing
 
