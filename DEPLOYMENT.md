@@ -31,6 +31,15 @@ In the service's **Settings**:
 - **Root Directory**: `server`
 - Railway should auto-detect `server/railway.json` (build command
   `npm run build`, start command `npm run start`, health check `/health`).
+  **If you set the config file path explicitly (via API/CLI instead of the
+  dashboard's auto-detect), it must be the path from the repo root —
+  `/server/railway.json` — not `railway.json`.** Root Directory and
+  Railway Config File are two independent settings; the config file path
+  does NOT get prefixed with Root Directory. Getting this wrong produces
+  "service config at 'railway.json' not found" and the build never gets
+  past initialization — no build logs at all, which makes it look like a
+  builder problem when it's actually a path problem. (Confirmed against
+  Railway's own docs: docs.railway.com/builds/build-configuration#set-the-root-directory.)
 
 In the service's **Variables**, add:
 
