@@ -13,7 +13,14 @@ services:
     runtime: node
     plan: free
     rootDir: server
-    buildCommand: npm run build
+    # --include=dev forces npm to install devDependencies even though
+    # NODE_ENV=production is set below. typescript, @types/express, etc.
+    # all live in devDependencies (they're build-time only, not needed at
+    # runtime) - without this flag, npm sees NODE_ENV=production and skips
+    # them, so `tsc` fails with "Cannot find module 'express' or its
+    # corresponding type declarations" (the module exists at runtime, its
+    # TYPES don't, because @types/express never got installed).
+    buildCommand: npm install --include=dev && npm run build
     startCommand: npm run start
     healthCheckPath: /health
     envVars:
