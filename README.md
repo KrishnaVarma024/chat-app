@@ -10,13 +10,15 @@ See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the system design and
 
 ## Status
 
-Phases 0–6 complete: schema, register/login, refresh-token rotation with
+Phases 0–7 complete: schema, register/login, refresh-token rotation with
 reuse detection, rooms & membership, atomic sequenced/idempotent message
-send, cursor pagination (poll + scrollback), and the React frontend
-(auth, room list, polling chat view, infinite scroll, optimistic send).
-Phase 7 (hardening: rate limiting, request-id logging, centralized error
-handling, input validation) is next. See `ROADMAP.md` for the full plan
-and each phase's definition of done.
+send, cursor pagination (poll + scrollback), the React frontend (auth,
+room list, polling chat view, infinite scroll, optimistic send), and
+hardening (per-user token-bucket rate limiting on send/poll, request-id
+propagated through every log line for a request, a centralized error
+handler with a consistent `{ error: { code, message } }` shape, and zod
+input validation on every route). Phase 8 (tests, docs, deploy) is next.
+See `ROADMAP.md` for the full plan and each phase's definition of done.
 
 ## Getting Started (server)
 

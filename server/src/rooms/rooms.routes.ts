@@ -19,12 +19,32 @@ import {
   DEFAULT_PAGE_LIMIT,
 } from '../db/messages.repo';
 import { ValidationError, NotFoundError } from '../errors';
+import { createRateLimiter } from '../rateLimit/rateLimit.middleware';
 
 export const roomsRouter = Router();
 
 // Every route under /rooms requires a logged-in user — there is no
 // anonymous or public access to any of this.
 roomsRouter.use(requireAuth);
+
+// Two separate limiters, not one shared budget: a client legitimately
+// polling every few seconds (possibly from more than one open tab) would
+// otherwise eat into the same budget as sending messages, throttling a
+// user who's just reading, not spamming. Numbers are sized against the
+// client's own polling behavior (usePolling.ts: base 3s, backs off to a
+// 15s cap, and Page Visibility pausing means an idle/backgrounded tab
+// sends nothing at all) with headroom for a couple of simultaneously open
+// tabs, while still being low enough to stop a scripted flood.
+const sendMessageLimiter = createRateLimiter({
+  keyPrefix: 'send',
+  capacity: 10, // burst: 10 messages fired back-to-back
+  refillPerSecond: 2, // sustained: 2/sec thereafter
+});
+const pollMessagesLimiter = createRateLimiter({
+  keyPrefix: 'poll',
+  capacity: 20, // burst: covers a few tabs all polling/scrolling back at once
+  refillPerSecond: 5, // sustained: 5/sec — well above what legitimate polling needs
+});
 
 const createRoomSchema = z.object({
   name: z.string().min(1).max(100),
@@ -96,6 +116,10 @@ const sendMessageSchema = z.object({
 
 roomsRouter.post(
   '/:roomId/messages',
+  // Rate limit before the membership check, not after: a request that's
+  // going to be rejected anyway shouldn't cost a DB round trip first —
+  // fail fast on the cheap check.
+  sendMessageLimiter,
   requireRoomMembership,
   async (req: RoomScopedRequest, res, next) => {
     try {
@@ -143,6 +167,7 @@ const listMessagesQuerySchema = z
  */
 roomsRouter.get(
   '/:roomId/messages',
+  pollMessagesLimiter,
   requireRoomMembership,
   async (req: RoomScopedRequest, res, next) => {
     try {
