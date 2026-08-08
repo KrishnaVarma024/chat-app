@@ -1,0 +1,57 @@
+databases:
+  - name: chat-app-db
+    plan: free
+    databaseName: chatapp
+    user: chatapp
+
+services:
+  # API — Express + Postgres. Free plan spins down after 15 min idle and
+  # cold-starts on the next request; fine for a portfolio project, not for
+  # something that needs to be always-warm.
+  - type: web
+    name: chat-app-server
+    runtime: node
+    plan: free
+    rootDir: server
+    buildCommand: npm run build
+    startCommand: npm run start
+    healthCheckPath: /health
+    envVars:
+      # Render wires this to the database above automatically — no copying
+      # a connection string by hand, same idea as Railway's ${{ }} refs.
+      - key: DATABASE_URL
+        fromDatabase:
+          name: chat-app-db
+          property: connectionString
+      # generateValue: true — Render mints a random 256-bit secret on
+      # first deploy. Never reuse the dev value from .env.example.
+      - key: JWT_SECRET
+        generateValue: true
+      - key: NODE_ENV
+        value: production
+      - key: ACCESS_TOKEN_TTL
+        value: 15m
+      # sync: false — Render prompts for this once, at Blueprint creation,
+      # instead of taking a value from this file. We don't know the
+      # client's URL yet at this point (see client service below), so this
+      # gets set to a placeholder now and fixed for real in step 5 of
+      # DEPLOYMENT.md, same ordering dependency as the Railway version.
+      - key: CORS_ORIGIN
+        sync: false
+
+  # Static frontend — Vite build served as static files.
+  - type: web
+    name: chat-app-client
+    runtime: static
+    rootDir: client
+    buildCommand: npm run build
+    staticPublishPath: dist
+    envVars:
+      # Same constraint as on Railway: Vite bakes this into the compiled
+      # JS at BUILD time, not read at runtime. Render prompts for it at
+      # Blueprint creation — paste the server's real onrender.com URL
+      # once you see it (it may not exist yet on the very first run
+      # through this form; if so, deploy the server alone first, copy its
+      # URL, then set this on the client service and redeploy it).
+      - key: VITE_API_URL
+        sync: false
