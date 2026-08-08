@@ -1,120 +1,104 @@
-# Deploying to Railway
+# Deploying to Render
 
-Three Railway services in one project: Postgres (Railway's own plugin),
-the API (`server/`), and the static frontend (`client/`). Free-tier/trial
-credit is enough for a portfolio project — check Railway's current pricing
-before you commit to anything paid.
+Live URLs (as of this deploy):
+- API: https://chat-app-server-j0mr.onrender.com
+- Client: https://chat-app-client-j5j9.onrender.com
 
-Do this in order. The order matters — steps 3 and 5 depend on URLs that
-don't exist until the service before them is deployed.
+Three pieces, defined together in `render.yaml` at the repo root as a
+Render **Blueprint**: a Postgres database, the API (`server/`) as a web
+service, and the static frontend (`client/`) as a static site. Free tier
+is enough for a portfolio project — the web service spins down after 15
+minutes idle and cold-starts (~50s) on the next request; fine for a demo,
+not for something that needs to always be warm.
 
 ## 1. Push this repo to GitHub
 
-Railway deploys from a GitHub repo. If you haven't already:
+Render deploys from a GitHub repo.
 
 ```bash
 cd "/Users/krishnavarma/100x Sch/v26/Chat App"
 git push origin master
 ```
 
-## 2. Create the Railway project + Postgres
+## 2. Deploy the Blueprint
 
-In the Railway dashboard: **New Project** → **Provision PostgreSQL**.
-That's it for this step — Railway gives this service its own
-`DATABASE_URL`, which you'll reference (not retype) in step 3.
+Render dashboard → **New** → **Blueprint** → pick this repo → branch
+`master` → Blueprint Path defaults to `render.yaml` at the repo root
+(that's where it lives here, so leave it).
 
-## 3. Deploy the server
+Render reads the file and shows you the three resources it's about to
+create (database, web service, static site) plus any variables marked
+`sync: false` in the file — it'll prompt for `CORS_ORIGIN` and
+`VITE_API_URL` right there, since neither URL exists yet at this point.
+Put in placeholders (e.g. `http://localhost:5173` for `CORS_ORIGIN`) —
+you'll fix both for real in step 4, same chicken-and-egg as any
+two-service deploy where each side needs the other's URL.
 
-**New Service** → **Deploy from GitHub repo** → pick this repo.
+Click **Deploy Blueprint**.
 
-In the service's **Settings**:
-- **Root Directory**: `server`
-- Railway should auto-detect `server/railway.json` (build command
-  `npm run build`, start command `npm run start`, health check `/health`).
-  **If you set the config file path explicitly (via API/CLI instead of the
-  dashboard's auto-detect), it must be the path from the repo root —
-  `/server/railway.json` — not `railway.json`.** Root Directory and
-  Railway Config File are two independent settings; the config file path
-  does NOT get prefixed with Root Directory. Getting this wrong produces
-  "service config at 'railway.json' not found" and the build never gets
-  past initialization — no build logs at all, which makes it look like a
-  builder problem when it's actually a path problem. (Confirmed against
-  Railway's own docs: docs.railway.com/builds/build-configuration#set-the-root-directory.)
+## 3. If the server's build fails with a `Cannot find module 'express'` error
 
-In the service's **Variables**, add:
+This bit us on the first real attempt, so it's worth documenting rather
+than rediscovering: `render.yaml` sets `NODE_ENV=production` on the
+server, and npm treats that as a signal to skip `devDependencies` during
+install — which is exactly where `typescript` and `@types/express` live.
+`tsc` still runs (so you get real compile errors, not a "command not
+found"), but half the type information is missing, cascading into a wall
+of `TS7006`/`TS2339` errors that all trace back to one root cause: express
+types never got installed.
 
-| Variable | Value |
-|---|---|
-| `DATABASE_URL` | Reference the Postgres service's `DATABASE_URL` (Railway's variable-reference picker, not a typed-in value — this is what lets the two services share credentials without you copying a connection string by hand). |
-| `JWT_SECRET` | Generate one locally: `node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"` — paste the output. Never reuse the dev value in `.env.example`. |
-| `NODE_ENV` | `production` |
-| `ACCESS_TOKEN_TTL` | `15m` |
-| `CORS_ORIGIN` | Leave as `http://localhost:5173` for now — you'll come back and fix this in step 5, once the client's real URL exists. |
+Fix (already applied in this repo's `render.yaml`): the server's
+`buildCommand` is `npm install --include=dev && npm run build`, which
+forces the dev-only, build-time-only packages in regardless of
+`NODE_ENV`. If you ever see this exact error shape again — one
+`Cannot find module 'X' or its corresponding type declarations'` plus a
+cascade of unrelated-looking implicit-`any` errors in the same build —
+check this first before assuming the code is broken.
 
-`PORT` doesn't need to be set — Railway injects it automatically, and
-`env.ts` already reads `process.env.PORT`.
+## 4. Fix the two placeholder URLs
 
-Deploy. Once it's live, copy its public URL (Settings → Networking →
-**Generate Domain** if one isn't already assigned) — you'll need it in
-step 4. Migrations run automatically on every boot (`npm run start` is
-`migrate:up:prod && node dist/index.js` — `node-pg-migrate` is
-idempotent, so this is safe to run on every deploy, not just the first).
+Once the server's deployed, copy its real `.onrender.com` URL (Render
+appends a random suffix — don't assume it matches the service name
+exactly, confirm it from the service's own page).
 
-## 4. Deploy the client
+- **Client** → **Environment** → set `VITE_API_URL` to the server's real
+  URL → save. This forces a rebuild, which is required: Vite bakes
+  `import.meta.env.VITE_API_URL` into the compiled JS at **build** time,
+  not read at runtime like a normal Node env var. Setting this after an
+  earlier build already ran means that build shipped without it — always
+  needs a fresh rebuild to take effect, not just a variable update.
+- **Server** → **Environment** → set `CORS_ORIGIN` to the client's real
+  URL → save. This one's just an env var + restart, no rebuild needed.
 
-**New Service** → **Deploy from GitHub repo** → same repo again.
+## 5. Smoke test
 
-In **Settings**: **Root Directory**: `client`.
-
-In **Variables**, add:
-
-| Variable | Value |
-|---|---|
-| `VITE_API_URL` | The server's public URL from step 3 (e.g. `https://chat-app-server-production.up.railway.app`). |
-
-**This has to be set before the build runs, not after.** Vite bakes
-`import.meta.env.VITE_API_URL` into the compiled JS at build time — it is
-NOT read at runtime like a normal Node env var. If you deploy the client
-first and add this variable afterward, the build already happened without
-it; you'd need to trigger a fresh deploy for it to take effect. Setting it
-before the first deploy avoids that entirely.
-
-Deploy, then copy the client's public URL too.
-
-## 5. Close the loop: fix CORS_ORIGIN on the server
-
-Go back to the **server** service's Variables and set:
-
-```
-CORS_ORIGIN=<the client's public URL from step 4>
-```
-
-This is the chicken-and-egg the two steps above set up on purpose: the
-client needs the server's URL to build correctly, and the server needs
-the client's URL to accept its requests — neither exists until the other
-service has already been deployed once. Updating this variable triggers a
-redeploy (fast — it's just an env var, not a rebuild) and the loop is
-closed.
-
-## 6. Smoke test
-
-Same test as local dev, just against the real URLs: open the client's
-public URL in two browser windows (or one normal + one incognito),
-register two different users, join the same room, send a message from
-one — it should appear in the other within one poll interval. Refresh a
-tab — you should stay logged in (silent refresh working), not get bounced
-to `/login`.
+Open the client's public URL in two browser windows (or one normal + one
+incognito), register two different users, join the same room, send a
+message from one — it should appear in the other within one poll
+interval. Refresh a tab — you should stay logged in (silent refresh
+working), not get bounced to `/login`.
 
 If refresh/silent-login specifically is broken in production but worked
 locally, the most likely cause is the `SameSite` cookie setting — see the
 comment in `server/src/auth/refresh-cookie.ts` for why it has to differ
-between `development` and `production` (this was caught and fixed before
-this guide was written, specifically because the client and API sit on
-different Railway subdomains, which is a genuinely different
-cross-site/same-site situation than two `localhost` ports in dev).
+between `development` and `production`. The client and API sit on
+different Render subdomains — genuinely cross-site — which is a different
+situation from two `localhost` ports in dev, where `SameSite=Strict` still
+works because same-site only cares about registrable domain, not port.
 
 ## Rolling back
 
-Railway keeps prior deployments — the dashboard's **Deployments** tab has
-a one-click **Redeploy** on any earlier build if a new deploy breaks
+Render keeps prior deploys — each service's **Events** tab has a
+**Rollback** button on any earlier successful deploy if a new one breaks
 something.
+
+## Why not Railway
+
+The first attempt at this was on Railway. Its GitHub App connection to
+this repo silently broke (`Settings → Source` showed "GitHub Repo not
+found") after the services were created via their API — every build died
+at initialization regardless of what config was fixed, and neither
+Railway's `redeploy` action nor a fresh GitHub push ever triggered a new
+build. That's a platform-connection problem, not something fixable from
+this repo's side, so the deploy target moved to Render instead of
+continuing to fight it.
