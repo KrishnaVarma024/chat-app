@@ -43,3 +43,17 @@ export function joinRoom(roomId: number): void {
 export function leaveRoom(roomId: number): void {
   getSocket()?.emit('leave_room', { roomId });
 }
+
+/**
+ * Fire-and-forget, same as joinRoom/leaveRoom — there's no return value to
+ * await, because confirmation doesn't come back as this call's result. It
+ * comes back later as either a 'message_ack' or an 'error' event carrying
+ * the same clientMessageId, which is what ChatRoomPage actually listens
+ * for (see server/src/realtime/messages.socket.ts). This mirrors how the
+ * old HTTP sendMessage() call used to work from the CALLER's point of view
+ * (optimistic bubble now, confirmation later) — only the transport
+ * carrying that confirmation changed.
+ */
+export function sendChatMessage(roomId: number, body: string, clientMessageId: string): void {
+  connectSocket().emit('send_message', { roomId, body, clientMessageId });
+}

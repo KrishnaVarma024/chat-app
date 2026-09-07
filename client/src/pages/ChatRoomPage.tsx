@@ -2,19 +2,21 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react
 import { Link, useParams } from 'react-router-dom';
 import { useAuth } from '../auth/AuthContext';
 import { getRoom } from '../api/rooms';
-import { pollMessages, fetchOlderMessages, fetchLatestMessages, sendMessage } from '../api/messages';
-import { encodeCursor } from '../api/cursor';
-import { usePolling } from '../hooks/usePolling';
+import { fetchOlderMessages, fetchLatestMessages } from '../api/messages';
+import { connectSocket, joinRoom, leaveRoom, sendChatMessage } from '../realtime/socket';
 import { mergeMessages } from '../utils/mergeMessages';
 import { MessageItem } from '../components/MessageItem';
 import { MessageInput } from '../components/MessageInput';
 import { ApiError } from '../api/client';
-import type { DisplayMessage, OptimisticMessage, Room } from '../types';
+import type { DisplayMessage, Message, OptimisticMessage, Room } from '../types';
 
-const BASE_POLL_INTERVAL_MS = 2000;
-const MAX_POLL_INTERVAL_MS = 30000;
 const NEAR_BOTTOM_THRESHOLD_PX = 100;
 const LOAD_OLDER_THRESHOLD_PX = 100;
+// Safety net only — see handleSend's comment. Generous on purpose: a
+// healthy round trip resolves in well under a second, so this only ever
+// fires when something actually went wrong (dropped event, connection
+// blip Phase 11 hasn't learned to queue through yet).
+const SEND_ACK_TIMEOUT_MS = 8000;
 
 export function ChatRoomPage() {
   const { roomId: roomIdParam } = useParams();
@@ -23,7 +25,6 @@ export function ChatRoomPage() {
 
   const [room, setRoom] = useState<Room | null>(null);
   const [messages, setMessages] = useState<DisplayMessage[]>([]);
-  const [pollCursor, setPollCursor] = useState<string | null>(null);
   const [olderCursor, setOlderCursor] = useState<string | null>(null);
   const [hasMoreOlder, setHasMoreOlder] = useState(false);
   const [isLoadingInitial, setIsLoadingInitial] = useState(true);
@@ -35,10 +36,14 @@ export function ChatRoomPage() {
   // applied after React commits the new DOM — see the layout effect below.
   const scrollActionRef = useRef<'bottom' | 'preserve-from-prepend' | null>(null);
   const preservedScrollHeightRef = useRef<number>(0);
-  const pollCursorRef = useRef<string | null>(null);
-  pollCursorRef.current = pollCursor;
 
   // ---- Initial load: latest page of history for this room ----
+  // Still a one-shot HTTP GET, not a socket event. Phase 10 replaces the
+  // REPEATING poll (below) with a push; it deliberately does not touch how
+  // a client bootstraps history when it first opens a room — that's Phase
+  // 12's job (join_room + sinceSequence + a catch_up batch), which reuses
+  // this exact cursor-pagination primitive for the "was disconnected, what
+  // did I miss" case too.
   useEffect(() => {
     let cancelled = false;
     setIsLoadingInitial(true);
@@ -53,10 +58,6 @@ export function ChatRoomPage() {
         setMessages(page.messages);
         setOlderCursor(page.next_cursor);
         setHasMoreOlder(page.has_more);
-        // See api/cursor.ts — this is the one place the client constructs
-        // a cursor itself, seeded from the plain integer latest_sequence_number
-        // rather than decoding anything the server sent as opaque.
-        setPollCursor(encodeCursor(page.latest_sequence_number));
         scrollActionRef.current = 'bottom';
       } catch (err) {
         if (!cancelled) setError(err instanceof ApiError ? err.message : 'Could not load this room.');
@@ -70,30 +71,71 @@ export function ChatRoomPage() {
     };
   }, [roomId]);
 
-  // ---- Poll loop: everything after our cursor, on an interval ----
-  const onPoll = useCallback(async (): Promise<boolean> => {
-    const cursor = pollCursorRef.current;
-    if (cursor === null) return false;
-    const page = await pollMessages(roomId, cursor);
-    setPollCursor(page.next_cursor ?? cursor);
-    if (page.messages.length === 0) return false;
+  // ---- Live delivery: join this room's socket channel, listen for pushes ----
+  // Gated on `isLoadingInitial` being false so this can't join and start
+  // receiving 'new_message' events before the initial setMessages(page.messages)
+  // above has run — that call REPLACES the whole array, so anything a fast
+  // 'new_message' delivered in between would be silently overwritten. There's
+  // still a small window between "initial load resolved" and "join_room ack'd"
+  // where a message could theoretically be missed; Phase 12's catch-up
+  // (re-querying by sequence number on every join) closes that gap generically
+  // instead of this effect specially patching around it.
+  useEffect(() => {
+    if (isLoadingInitial) return;
+    const socket = connectSocket();
 
-    const container = containerRef.current;
-    const wasNearBottom = container
-      ? container.scrollHeight - container.scrollTop - container.clientHeight < NEAR_BOTTOM_THRESHOLD_PX
-      : true;
+    function handleConnect() {
+      // Re-joins on every 'connect' event, not just the first — this
+      // includes Socket.IO's own automatic reconnects (never disabled),
+      // so a brief drop-and-reconnect while this page stays open
+      // re-subscribes to live events without the user doing anything.
+      // Phase 11/12 build proper backoff timing and gap-filling on top of
+      // this; this is just "don't stay silently un-joined after a
+      // reconnect."
+      joinRoom(roomId);
+    }
 
-    setMessages((prev) => mergeMessages(prev, page.messages));
-    if (wasNearBottom) scrollActionRef.current = 'bottom';
-    return true;
-  }, [roomId]);
+    function handleNewMessage(msg: Message) {
+      const container = containerRef.current;
+      const wasNearBottom = container
+        ? container.scrollHeight - container.scrollTop - container.clientHeight < NEAR_BOTTOM_THRESHOLD_PX
+        : true;
+      setMessages((prev) => mergeMessages(prev, [msg]));
+      if (wasNearBottom) scrollActionRef.current = 'bottom';
+    }
 
-  usePolling({
-    baseIntervalMs: BASE_POLL_INTERVAL_MS,
-    maxIntervalMs: MAX_POLL_INTERVAL_MS,
-    onPoll,
-    enabled: !isLoadingInitial && pollCursor !== null,
-  });
+    function handleMessageAck(msg: Message) {
+      // Same reconciliation path as the old HTTP confirmation: mergeMessages
+      // keys on client_message_id, so this just replaces the optimistic
+      // "Sending…" bubble with the confirmed row.
+      setMessages((prev) => mergeMessages(prev, [msg]));
+    }
+
+    function handleSocketError(data: { error?: { code?: string; message?: string }; clientMessageId?: string }) {
+      // Room-level errors (a bad join_room) don't carry a clientMessageId —
+      // nothing to reconcile here, just a send_message failure.
+      if (!data?.clientMessageId) return;
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.client_message_id === data.clientMessageId && 'status' in m ? { ...m, status: 'failed' as const } : m
+        )
+      );
+    }
+
+    socket.on('connect', handleConnect);
+    socket.on('new_message', handleNewMessage);
+    socket.on('message_ack', handleMessageAck);
+    socket.on('error', handleSocketError);
+    if (socket.connected) joinRoom(roomId); // already connected before this effect ran
+
+    return () => {
+      socket.off('connect', handleConnect);
+      socket.off('new_message', handleNewMessage);
+      socket.off('message_ack', handleMessageAck);
+      socket.off('error', handleSocketError);
+      leaveRoom(roomId);
+    };
+  }, [roomId, isLoadingInitial]);
 
   // ---- Scrollback: load an older page when the user scrolls near the top ----
   const loadOlder = useCallback(async () => {
@@ -136,8 +178,8 @@ export function ChatRoomPage() {
     scrollActionRef.current = null;
   }, [messages]);
 
-  // ---- Optimistic send ----
-  async function handleSend(body: string) {
+  // ---- Optimistic send, over the socket instead of HTTP ----
+  function handleSend(body: string) {
     if (!user) return;
     const clientMessageId = crypto.randomUUID();
     const optimistic: OptimisticMessage = {
@@ -153,16 +195,26 @@ export function ChatRoomPage() {
     setMessages((prev) => [...prev, optimistic]);
     scrollActionRef.current = 'bottom';
 
-    try {
-      const confirmed = await sendMessage(roomId, body, clientMessageId);
-      setMessages((prev) => mergeMessages(prev, [confirmed]));
-    } catch {
+    // Fire-and-forget emit — no promise to await, no try/catch here.
+    // Confirmation (or rejection) arrives later as a 'message_ack' or
+    // 'error' event carrying this same clientMessageId (handled in the
+    // effect above). This IS a real behavior change from the HTTP version:
+    // there is no synchronous "did this even reach the server" signal
+    // anymore, which is exactly why the timeout below exists — Phase 11's
+    // offline queue is the real, permanent fix for "the socket was down
+    // when I hit send," not this timeout. This is just a stopgap so a
+    // dropped message doesn't say "Sending…" forever in the meantime.
+    sendChatMessage(roomId, body, clientMessageId);
+
+    window.setTimeout(() => {
       setMessages((prev) =>
         prev.map((m) =>
-          m.client_message_id === clientMessageId && 'status' in m ? { ...m, status: 'failed' as const } : m
+          m.client_message_id === clientMessageId && 'status' in m && m.status === 'pending'
+            ? { ...m, status: 'failed' as const }
+            : m
         )
       );
-    }
+    }, SEND_ACK_TIMEOUT_MS);
   }
 
   if (isLoadingInitial) return <div className="boot-screen">Loading room…</div>;

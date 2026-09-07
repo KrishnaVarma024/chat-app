@@ -20,6 +20,7 @@ import {
 } from '../db/messages.repo';
 import { ValidationError, NotFoundError } from '../errors';
 import { createRateLimiter } from '../rateLimit/rateLimit.middleware';
+import { sendMessageSchema } from './messages.validation';
 
 export const roomsRouter = Router();
 
@@ -106,12 +107,6 @@ roomsRouter.post('/:roomId/leave', requireRoomMembership, async (req: RoomScoped
   } catch (err) {
     next(err);
   }
-});
-
-const sendMessageSchema = z.object({
-  body: z.string().min(1).max(4000),
-  // Client-generated — this is the idempotency key, see messages.repo.ts.
-  clientMessageId: z.string().uuid(),
 });
 
 roomsRouter.post(
