@@ -2,6 +2,7 @@ import { createContext, useContext, useEffect, useState, type ReactNode } from '
 import { refreshAccessToken } from '../api/client';
 import { onAccessTokenChange } from '../api/tokenStore';
 import { login as apiLogin, register as apiRegister, logout as apiLogout, fetchMe } from '../api/auth';
+import { disconnectSocket } from '../realtime/socket';
 import type { User } from '../types';
 
 interface AuthContextValue {
@@ -71,6 +72,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   async function logout() {
     await apiLogout();
     setUser(null);
+    // The socket is a session-scoped resource, same as the access token —
+    // logging out ends it rather than leaving a connection (still
+    // authenticated as the just-logged-out user, from the server's point
+    // of view, until it eventually notices) hanging around.
+    disconnectSocket();
   }
 
   return (

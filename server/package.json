@@ -23,7 +23,8 @@
     "test:refresh-race": "node scripts/refresh-race-test.mjs",
     "test:register-race": "node scripts/register-race-test.mjs",
     "test:leave-race": "node scripts/leave-race-test.mjs",
-    "test:socket-foundation": "node scripts/socket-foundation-test.mjs"
+    "test:socket-foundation": "node scripts/socket-foundation-test.mjs",
+    "test:socket-messaging": "node scripts/socket-messaging-test.mjs"
   },
   "dependencies": {
     "bcrypt": "^6.0.0",

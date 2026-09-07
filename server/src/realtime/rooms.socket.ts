@@ -22,16 +22,25 @@ export function roomKey(roomId: number): string {
  * specific parsing path — one error contract for the whole app, regardless
  * of which transport produced it.
  */
-function emitError(socket: Socket, err: unknown): void {
+/**
+ * Exported (not just used locally) because Phase 10's messages.socket.ts
+ * needs the exact same error shape for send_message failures — one
+ * function producing `{ error: { code, message } }`, regardless of which
+ * socket event triggered it. `extra` merges in event-specific context
+ * (e.g. send_message attaches `clientMessageId` so the client can tell
+ * *which* in-flight optimistic bubble a given error belongs to, instead of
+ * guessing from a timeout — see ChatRoomPage.tsx's handleSocketError).
+ */
+export function emitError(socket: Socket, err: unknown, extra: Record<string, unknown> = {}): void {
   if (err instanceof AppError) {
-    socket.emit('error', { error: { code: err.code, message: err.message } });
+    socket.emit('error', { error: { code: err.code, message: err.message }, ...extra });
     return;
   }
   logger.error('unexpected socket error', {
     socketId: socket.id,
     error: err instanceof Error ? err.message : String(err),
   });
-  socket.emit('error', { error: { code: 'INTERNAL_ERROR', message: 'Something went wrong' } });
+  socket.emit('error', { error: { code: 'INTERNAL_ERROR', message: 'Something went wrong' }, ...extra });
 }
 
 /**
