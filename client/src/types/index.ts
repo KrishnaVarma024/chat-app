@@ -29,13 +29,24 @@ export interface Message {
   created_at: string;
 }
 
-// A message the UI has shown before the server confirmed it — see
-// api/messages.ts sendMessageOptimistic. `status` lets the UI render a
-// "sending..." affordance and distinguish a real row from a placeholder.
+// A message the UI has shown before the server confirmed it. `status`
+// lets the UI render the right affordance and distinguish a real row from
+// a placeholder:
+//  - 'queued'  — sitting in the client-side outbox (realtime/outbox.ts),
+//                not currently in flight; either the socket was
+//                disconnected when this was sent, or it was in flight and
+//                got knocked back to 'queued' by a disconnect before an
+//                ack arrived (Phase 11 — see ChatRoomPage's 'disconnect'
+//                handler).
+//  - 'pending' — handed to a connected socket, awaiting message_ack.
+//  - 'failed'  — the server sent back a definitive (non-retryable)
+//                rejection for this exact clientMessageId; it has already
+//                been dropped from the outbox and will not be retried
+//                automatically.
 export interface OptimisticMessage extends Omit<Message, 'id' | 'sequence_number'> {
   id: number | null;
   sequence_number: number | null;
-  status: 'pending' | 'failed';
+  status: 'queued' | 'pending' | 'failed';
 }
 
 export type DisplayMessage = Message | OptimisticMessage;
