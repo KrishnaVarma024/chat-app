@@ -57,3 +57,18 @@ export interface MessagesPage {
   has_more: boolean;
   next_cursor: string | null;
 }
+
+// What the server emits in response to join_room's optional sinceSequence
+// (Phase 12 — ARCHITECTURE_V2.md §7). Deliberately plain numeric fields, not
+// the opaque base64 cursor the HTTP pagination API uses (cursor.ts): a
+// socket client already tracks the numeric highest sequence_number it's
+// seen for this room in memory (it's exactly the value it just sent AS
+// sinceSequence), so there's no "client should never construct one by hand"
+// concern here the way there is for HTTP's next_cursor — this cursor never
+// leaves this one round trip.
+export interface CatchUpBatch {
+  roomId: number;
+  messages: Message[];
+  hasMore: boolean;
+  latestSequenceNumber: number;
+}

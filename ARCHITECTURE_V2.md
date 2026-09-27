@@ -307,6 +307,28 @@ the next page with the same mechanism, exactly as v1's poll route did —
 catching up in a couple of round trips instead of ever silently dropping
 messages older than the last page fetched.
 
+**Implementation note (Phase 12):** "the same mechanism" turned out to
+mean, literally, re-emitting `join_room` itself — not a second dedicated
+event. `socket.join()` on a room this socket already belongs to is a
+harmless no-op (Socket.IO's own join bookkeeping is a `Set` under the
+hood), so a follow-up page request for a large gap and a brand-new join
+are indistinguishable to the server: both just run the catch-up query
+against whatever `sinceSequence` was sent and emit a `catch_up` batch
+before touching membership. One event, one code path, instead of a
+second event that would have to duplicate the membership check and the
+join-ordering guarantee.
+
+Client-side, `ChatRoomPage.tsx` tracks the highest `sequence_number` it
+has ever displayed for the room in a ref (not state — it's read inside
+socket event-handler closures and needs its value at call time, not
+whatever a render closed over). That ref is seeded from the initial HTTP
+page's `latest_sequence_number` and updated on every `new_message`,
+`message_ack`, and `catch_up` batch — so the exact same value flows into
+`join_room` whether this is the very first join, a reconnect after a
+network drop, or a follow-up page request for `has_more: true`. There is
+deliberately no special-cased "first join" branch beyond the ref simply
+starting from wherever the HTTP load left off.
+
 ## 8. Heartbeat & Dead-Connection Detection
 
 A TCP connection can outlive the network path that was carrying it — a

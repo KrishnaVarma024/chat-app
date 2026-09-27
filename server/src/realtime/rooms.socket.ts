@@ -1,5 +1,6 @@
 import type { Server, Socket } from 'socket.io';
 import { checkRoomMembership } from '../rooms/rooms.middleware';
+import { listMessagesAfter, DEFAULT_PAGE_LIMIT } from '../db/messages.repo';
 import { AppError, ValidationError } from '../errors';
 import { logger } from '../observability/logger';
 import type { AuthedSocketData } from './socketAuth.middleware';
@@ -56,17 +57,60 @@ export function emitError(socket: Socket, err: unknown, extra: Record<string, un
 export function registerRoomHandlers(_io: Server, socket: Socket): void {
   const { userId } = socket.data as AuthedSocketData;
 
-  socket.on('join_room', async (payload: { roomId?: number }) => {
+  socket.on('join_room', async (payload: { roomId?: number; sinceSequence?: number }) => {
     const roomId = Number(payload?.roomId);
     if (!Number.isInteger(roomId) || roomId <= 0) {
       return emitError(socket, new ValidationError('Invalid room id'));
     }
 
+    // Optional on purpose: a client's very first-ever join of a room (no
+    // local history at all) has no sequence number to catch up FROM — it
+    // just loaded the latest page over HTTP, same as always. Every rejoin
+    // after that (a reconnect, or a follow-up page request below) always
+    // has one, because the client tracks the highest sequence_number it's
+    // ever displayed for this room. `undefined` and "not a valid integer"
+    // are treated identically: skip catch-up, just join.
+    let sinceSequence: number | undefined;
+    if (payload?.sinceSequence !== undefined) {
+      const parsed = Number(payload.sinceSequence);
+      if (!Number.isInteger(parsed) || parsed < 0) {
+        return emitError(socket, new ValidationError('Invalid sinceSequence'));
+      }
+      sinceSequence = parsed;
+    }
+
     try {
       await checkRoomMembership(roomId, userId);
+
+      // See ARCHITECTURE_V2.md §7: the catch-up query runs and is emitted
+      // to THIS socket BEFORE socket.join, deliberately. If join happened
+      // first, a message sent by someone else in the microseconds between
+      // "membership confirmed" and "catch-up query executes" could land in
+      // BOTH the catch-up batch (the DB already has it) AND arrive again
+      // as a live 'new_message' (this socket is now in the room). Running
+      // the query first, then joining, means the catch-up query's own
+      // snapshot is the only source for anything up to that point, and
+      // 'new_message' is the only source for anything after — no seam
+      // where a message could appear twice or not at all. A duplicate
+      // wouldn't even be visibly wrong client-side (mergeMessages dedupes
+      // by client_message_id), but "correct by construction" beats
+      // "happens to be masked by an unrelated dedupe."
+      if (sinceSequence !== undefined) {
+        const { messages, hasMore } = await listMessagesAfter(roomId, sinceSequence, DEFAULT_PAGE_LIMIT);
+        const latestSequenceNumber =
+          messages.length > 0 ? messages[messages.length - 1].sequence_number : sinceSequence;
+        socket.emit('catch_up', { roomId, messages, hasMore, latestSequenceNumber });
+      }
+
+      // Safe to call even if this socket already joined this room earlier
+      // in the same connection (Socket.IO's own room-join bookkeeping is a
+      // Set under the hood) — this is what lets a follow-up page request
+      // for a large gap reuse this exact same event instead of needing a
+      // second one: the client just re-emits join_room with an updated
+      // sinceSequence, and re-joining is a harmless no-op.
       await socket.join(roomKey(roomId));
       socket.emit('joined_room', { roomId });
-      logger.info('socket joined room', { userId, roomId, socketId: socket.id });
+      logger.info('socket joined room', { userId, roomId, socketId: socket.id, sinceSequence });
     } catch (err) {
       emitError(socket, err);
     }

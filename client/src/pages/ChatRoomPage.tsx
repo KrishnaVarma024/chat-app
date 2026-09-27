@@ -8,7 +8,7 @@ import { mergeMessages } from '../utils/mergeMessages';
 import { MessageItem } from '../components/MessageItem';
 import { MessageInput } from '../components/MessageInput';
 import { ApiError } from '../api/client';
-import type { DisplayMessage, Message, OptimisticMessage, Room } from '../types';
+import type { CatchUpBatch, DisplayMessage, Message, OptimisticMessage, Room } from '../types';
 
 const NEAR_BOTTOM_THRESHOLD_PX = 100;
 const LOAD_OLDER_THRESHOLD_PX = 100;
@@ -32,6 +32,17 @@ export function ChatRoomPage() {
   const scrollActionRef = useRef<'bottom' | 'preserve-from-prepend' | null>(null);
   const preservedScrollHeightRef = useRef<number>(0);
 
+  // The highest sequence_number this client has ever displayed for this
+  // room — what every join_room call after the very first one sends as
+  // sinceSequence (Phase 12 — ARCHITECTURE_V2.md §7). A ref, not state:
+  // it's read inside socket event handler closures and needs its CURRENT
+  // value at call time, not the value from whichever render closed over
+  // it — using state here would mean either stale reads or adding it to
+  // the effect's dependency array and re-subscribing every socket listener
+  // on every single message, which is unnecessary churn for a value that
+  // never needs to trigger a re-render on its own.
+  const lastKnownSequenceRef = useRef<number | null>(null);
+
   // ---- Initial load: latest page of history for this room ----
   // Still a one-shot HTTP GET, not a socket event. Phase 10 replaces the
   // REPEATING poll (below) with a push; it deliberately does not touch how
@@ -53,6 +64,12 @@ export function ChatRoomPage() {
         setMessages(page.messages);
         setOlderCursor(page.next_cursor);
         setHasMoreOlder(page.has_more);
+        // Baseline for Phase 12 catch-up: the live-join effect below fires
+        // right after this (gated on isLoadingInitial), and its very first
+        // join_room already has something concrete to send as
+        // sinceSequence — "nothing sent after this" — rather than needing
+        // a special "no history yet" case of its own.
+        lastKnownSequenceRef.current = page.latest_sequence_number;
         scrollActionRef.current = 'bottom';
       } catch (err) {
         if (!cancelled) setError(err instanceof ApiError ? err.message : 'Could not load this room.');
@@ -85,10 +102,12 @@ export function ChatRoomPage() {
       // the backoff/jitter timing; this is what actually acts on each
       // attempt that succeeds), so a brief drop-and-reconnect while this
       // page stays open re-subscribes to live events without the user
-      // doing anything. Phase 12 adds gap-filling (catch-up) on top of
-      // this; this is just "don't stay silently un-joined after a
-      // reconnect."
-      joinRoom(roomId);
+      // doing anything. Passing lastKnownSequenceRef.current is what turns
+      // that bare re-join into gap-filling (Phase 12): the server runs a
+      // catch_up query for exactly what happened in this room while this
+      // client was disconnected, and emits it before this join takes
+      // effect for live delivery — see rooms.socket.ts's join_room handler.
+      joinRoom(roomId, lastKnownSequenceRef.current ?? undefined);
 
       // The outbox (realtime/outbox.ts, wired in socket.ts) is what
       // actually re-sends anything still queued — this only updates what
@@ -121,6 +140,7 @@ export function ChatRoomPage() {
         ? container.scrollHeight - container.scrollTop - container.clientHeight < NEAR_BOTTOM_THRESHOLD_PX
         : true;
       setMessages((prev) => mergeMessages(prev, [msg]));
+      lastKnownSequenceRef.current = Math.max(lastKnownSequenceRef.current ?? 0, msg.sequence_number);
       if (wasNearBottom) scrollActionRef.current = 'bottom';
     }
 
@@ -129,6 +149,31 @@ export function ChatRoomPage() {
       // keys on client_message_id, so this just replaces the optimistic
       // "Sending…" bubble with the confirmed row.
       setMessages((prev) => mergeMessages(prev, [msg]));
+      lastKnownSequenceRef.current = Math.max(lastKnownSequenceRef.current ?? 0, msg.sequence_number);
+    }
+
+    // Phase 12 — ARCHITECTURE_V2.md §7. Fires once per page of missed
+    // history: the very first batch after a join_room that named a
+    // sinceSequence, and again for each has_more follow-up below. Keyed by
+    // roomId (not just "any catch_up on this socket") because the socket
+    // is a global singleton — if the user has already navigated away from
+    // this room by the time a slow response lands, this effect's cleanup
+    // will already have removed this exact listener, but the guard is
+    // cheap insurance against any ordering surprise, not load-bearing.
+    function handleCatchUp(batch: CatchUpBatch) {
+      if (batch.roomId !== roomId) return;
+      if (batch.messages.length > 0) {
+        setMessages((prev) => mergeMessages(prev, batch.messages));
+      }
+      lastKnownSequenceRef.current = Math.max(lastKnownSequenceRef.current ?? 0, batch.latestSequenceNumber);
+      if (batch.hasMore) {
+        // Same mechanism as any other join — see rooms.socket.ts's
+        // comment on why re-joining an already-joined room is a harmless
+        // no-op. This is what turns "the gap was bigger than one page"
+        // into a couple of quick round trips instead of ever silently
+        // truncating history at the first page's boundary.
+        joinRoom(roomId, lastKnownSequenceRef.current);
+      }
     }
 
     function handleSocketError(data: { error?: { code?: string; message?: string }; clientMessageId?: string }) {
@@ -146,14 +191,24 @@ export function ChatRoomPage() {
     socket.on('disconnect', handleDisconnect);
     socket.on('new_message', handleNewMessage);
     socket.on('message_ack', handleMessageAck);
+    socket.on('catch_up', handleCatchUp);
     socket.on('error', handleSocketError);
-    if (socket.connected) joinRoom(roomId); // already connected before this effect ran
+    // Already connected before this effect ran (e.g. navigating between
+    // two rooms without ever losing the connection) — still passes
+    // sinceSequence, same as handleConnect, since "already connected" says
+    // nothing about whether messages arrived in this room while the user
+    // was viewing some OTHER room. lastKnownSequenceRef.current is exactly
+    // this room's own baseline set by the initial-load effect above, so
+    // this join is correct whether the user is opening this room for the
+    // first time or returning to it.
+    if (socket.connected) joinRoom(roomId, lastKnownSequenceRef.current ?? undefined);
 
     return () => {
       socket.off('connect', handleConnect);
       socket.off('disconnect', handleDisconnect);
       socket.off('new_message', handleNewMessage);
       socket.off('message_ack', handleMessageAck);
+      socket.off('catch_up', handleCatchUp);
       socket.off('error', handleSocketError);
       leaveRoom(roomId);
     };
