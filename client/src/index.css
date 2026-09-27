@@ -212,6 +212,10 @@ a {
   background: #dbeafe;
 }
 
+.message-item.optimistic-queued {
+  opacity: 0.5;
+}
+
 .message-item.optimistic-pending {
   opacity: 0.6;
 }
@@ -243,6 +247,10 @@ a {
 
 .message-status.failed {
   color: #dc2626;
+}
+
+.message-status.queued {
+  color: #b45309;
 }
 
 .message-input {

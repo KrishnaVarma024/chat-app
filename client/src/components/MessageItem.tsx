@@ -17,6 +17,9 @@ export function MessageItem({ message, isOwn, ownUsername }: MessageItemProps) {
         <time>{new Date(message.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time>
       </div>
       <div className="message-body">{message.body}</div>
+      {isOptimistic && message.status === 'queued' && (
+        <span className="message-status queued">Waiting for connection…</span>
+      )}
       {isOptimistic && message.status === 'pending' && <span className="message-status">Sending…</span>}
       {isOptimistic && message.status === 'failed' && <span className="message-status failed">Failed to send</span>}
     </div>

@@ -185,8 +185,9 @@ spreads them out across clients too, so the herd never forms in the
 first place.
 
 ```ts
-io("wss://api.example.com", {
-  auth: { token: accessToken },
+// client/src/realtime/socket.ts
+io(API_BASE, {
+  auth: (cb) => cb({ token: getAccessToken() }),
   reconnection: true,
   reconnectionDelay: 1000,        // first retry after ~1s
   reconnectionDelayMax: 30000,    // never wait longer than 30s between attempts
@@ -199,26 +200,67 @@ Socket.IO implements the mechanics; understanding *why* these specific
 numbers (and not, say, a flat 5s retry) is the actual skill being
 demonstrated.
 
-**Offline message queue.** While disconnected, any `send_message` the
-user triggers doesn't just fail — it's appended to an ordered in-memory
-queue (persisted to `localStorage` too, so a page reload while offline
-doesn't lose it):
+**Offline message queue — an outbox, not a retry wrapper.** Rather than
+"try to emit, and queue only if that fails," `sendChatMessage` always
+enqueues first, then asks the queue to flush (a no-op if disconnected,
+immediate if not). This unifies two cases that would otherwise need
+separate handling: a message composed while genuinely offline, and a
+message that WAS emitted but whose `message_ack` never arrived before
+the connection dropped ("in flight at the moment of disconnect"). Both
+just mean "still sitting in the queue," and the exact same flush path —
+triggered on send, and again on every `connect`/reconnect — covers both:
 
 ```ts
-type QueuedMessage = { clientMessageId: string; roomId: string; body: string; queuedAt: number };
+// client/src/realtime/outbox.ts
+export interface QueuedMessage {
+  roomId: number;
+  clientMessageId: string;
+  body: string;
+  queuedAt: string;
+}
 ```
 
-On the client's `connect`/`reconnect` event, the entire queue is
-replayed **in order**, via the same `send_message` emit a live send
-would use. Because the server-side insert is idempotent on
-`clientMessageId`, replaying a message that actually *did* make it
-through before the disconnect (the emit succeeded but the `message_ack`
-never arrived) is safe — the unique constraint silently no-ops the
-duplicate, and the server can still return the correct `message_ack` for
-it by fetching the existing row instead of erroring. The queue doesn't
-need to know whether a given message actually landed; it only needs to
-know whether it was *acked*, and idempotency covers the gap between
-those two facts.
+The queue lives in a module with **zero dependency on the socket
+module** — `flushQueueOverSocket(socket)` takes the socket as a
+parameter rather than importing `connectSocket`/`getSocket` itself. It's
+`socket.ts` that owns the wiring, attaching the queue's flush function to
+`connect`, and removing an entry the moment its `message_ack` (or a
+definitive `error` naming its `clientMessageId`) arrives — registered
+once, at socket-creation time, independent of whichever room UI happens
+to be mounted, since message durability is a property of the connection,
+not of a particular page.
+
+`flushQueueOverSocket` deliberately does **not** track "already emitted,
+awaiting ack" as a separate state from "never attempted" — every call
+just re-emits everything still in the queue, unconditionally, including
+an item a previous flush already sent moments ago. That's not an
+oversight; it's leaning on the exact guarantee the previous phases
+built: the server's `(room_id, sender_id, client_message_id)` unique
+constraint (Phase 4) makes any number of duplicate `send_message` emits
+for the same `clientMessageId` collapse to exactly one row, each one
+getting back the same `message_ack`. Client-side "don't resend what
+might already be in flight" bookkeeping would be complexity in service
+of avoiding a redundant round trip, not in service of correctness —
+correctness already comes from the database, for free. Persistence to
+`localStorage` (loaded once at module init, written on every enqueue/
+dequeue) is what makes a queued message survive a full page reload while
+offline, not just an in-memory disconnect.
+
+**The optimistic UI has three states, not two, driven entirely by
+events — no timeout anywhere.** Phase 10 shipped a client-side timeout as
+an honest stopgap: nothing else would ever revisit a bubble stuck on
+"Sending…" if its ack never arrived. Phase 11 replaces that guess with
+real event-driven transitions: `queued` (sitting in the outbox, nothing
+to flush to right now) → `pending` (flushed to a live connection,
+awaiting `message_ack`) → either confirmed (an incoming `message_ack`
+replaces the bubble via `mergeMessages`, same as Phase 10) or `failed`
+(a definitive, non-retryable error named this `clientMessageId`). A
+`disconnect` while a message is `pending` moves it back to `queued`
+(the outbox already holds it regardless; this only corrects what the UI
+shows), and the next `connect` moves any of that room's `queued` bubbles
+back to `pending` as the flush fires. Nothing here needed a single change
+to server code — Phase 4's idempotency guarantee was already strong
+enough to make Phase 11 a client-only phase.
 
 ## 7. Missed-Message Catch-Up on Reconnect
 
@@ -457,6 +499,19 @@ fast as a fresh connection allows.
 
 ## 15. What a Reviewer Should Notice
 
+- Phase 11's own verification work found a real crash bug in Phase 10's
+  code, not a theoretical one: `socket.ts`'s per-connection username
+  lookup (`findUserById(userId).then(...)`) had no `.catch()`. A socket
+  that connects and disconnects again without ever sending a message
+  means nothing ever awaits that promise before it settles — if the
+  lookup itself rejected (reproduced here via a DB hiccup under
+  concurrent load), Node treats that as an unhandled rejection and
+  crashes the **entire process**, dropping every connected user, not
+  just the one whose lookup failed. Fixed with a `.catch()` that
+  resolves to `null` instead of ever leaving the promise rejected — the
+  general lesson (any promise whose consumption is optional or delayed
+  needs a guaranteed-resolution path, not just a happy-path `.then()`)
+  generalizes well past this one call site.
 - The socket layer reuses v1's core functions rather than
   reimplementing send/membership/pagination logic — a duplicate
   `send_message` from an offline-queue replay is safe for the exact same

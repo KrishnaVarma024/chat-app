@@ -3,7 +3,7 @@ import { Link, useParams } from 'react-router-dom';
 import { useAuth } from '../auth/AuthContext';
 import { getRoom } from '../api/rooms';
 import { fetchOlderMessages, fetchLatestMessages } from '../api/messages';
-import { connectSocket, joinRoom, leaveRoom, sendChatMessage } from '../realtime/socket';
+import { connectSocket, isSocketConnected, joinRoom, leaveRoom, sendChatMessage } from '../realtime/socket';
 import { mergeMessages } from '../utils/mergeMessages';
 import { MessageItem } from '../components/MessageItem';
 import { MessageInput } from '../components/MessageInput';
@@ -12,11 +12,6 @@ import type { DisplayMessage, Message, OptimisticMessage, Room } from '../types'
 
 const NEAR_BOTTOM_THRESHOLD_PX = 100;
 const LOAD_OLDER_THRESHOLD_PX = 100;
-// Safety net only — see handleSend's comment. Generous on purpose: a
-// healthy round trip resolves in well under a second, so this only ever
-// fires when something actually went wrong (dropped event, connection
-// blip Phase 11 hasn't learned to queue through yet).
-const SEND_ACK_TIMEOUT_MS = 8000;
 
 export function ChatRoomPage() {
   const { roomId: roomIdParam } = useParams();
@@ -86,13 +81,38 @@ export function ChatRoomPage() {
 
     function handleConnect() {
       // Re-joins on every 'connect' event, not just the first — this
-      // includes Socket.IO's own automatic reconnects (never disabled),
-      // so a brief drop-and-reconnect while this page stays open
-      // re-subscribes to live events without the user doing anything.
-      // Phase 11/12 build proper backoff timing and gap-filling on top of
+      // includes Socket.IO's own automatic reconnects (Phase 11 configures
+      // the backoff/jitter timing; this is what actually acts on each
+      // attempt that succeeds), so a brief drop-and-reconnect while this
+      // page stays open re-subscribes to live events without the user
+      // doing anything. Phase 12 adds gap-filling (catch-up) on top of
       // this; this is just "don't stay silently un-joined after a
       // reconnect."
       joinRoom(roomId);
+
+      // The outbox (realtime/outbox.ts, wired in socket.ts) is what
+      // actually re-sends anything still queued — this only updates what
+      // THIS room's UI shows while that happens. Any of this room's own
+      // messages still sitting in 'queued' are about to be flushed, so
+      // reflect that immediately rather than waiting for their acks.
+      setMessages((prev) =>
+        prev.map((m) => ('status' in m && m.status === 'queued' ? { ...m, status: 'pending' as const } : m))
+      );
+    }
+
+    function handleDisconnect() {
+      // A message that was already flushed to the (now-dead) connection
+      // and is still awaiting its ack has an unknown fate — Socket.IO
+      // gives no "your emit definitely didn't arrive" signal, only
+      // "the connection is gone now." The outbox itself doesn't need to
+      // do anything here (the message is still sitting in its queue
+      // regardless of what the UI shows, and will be re-flushed on the
+      // next 'connect'); this just corrects the UI's optimistic guess
+      // from "sending" back to "waiting for connection," since "sending"
+      // is no longer true of a socket that isn't connected.
+      setMessages((prev) =>
+        prev.map((m) => ('status' in m && m.status === 'pending' ? { ...m, status: 'queued' as const } : m))
+      );
     }
 
     function handleNewMessage(msg: Message) {
@@ -123,6 +143,7 @@ export function ChatRoomPage() {
     }
 
     socket.on('connect', handleConnect);
+    socket.on('disconnect', handleDisconnect);
     socket.on('new_message', handleNewMessage);
     socket.on('message_ack', handleMessageAck);
     socket.on('error', handleSocketError);
@@ -130,6 +151,7 @@ export function ChatRoomPage() {
 
     return () => {
       socket.off('connect', handleConnect);
+      socket.off('disconnect', handleDisconnect);
       socket.off('new_message', handleNewMessage);
       socket.off('message_ack', handleMessageAck);
       socket.off('error', handleSocketError);
@@ -178,7 +200,7 @@ export function ChatRoomPage() {
     scrollActionRef.current = null;
   }, [messages]);
 
-  // ---- Optimistic send, over the socket instead of HTTP ----
+  // ---- Optimistic send, through the durable outbox instead of a bare emit ----
   function handleSend(body: string) {
     if (!user) return;
     const clientMessageId = crypto.randomUUID();
@@ -190,31 +212,27 @@ export function ChatRoomPage() {
       client_message_id: clientMessageId,
       body,
       created_at: new Date().toISOString(),
-      status: 'pending',
+      // Known, not guessed: sendChatMessage always enqueues before
+      // attempting to flush, so whether this lands as 'pending' (about to
+      // be flushed to a live connection) or 'queued' (nowhere to flush to
+      // yet) is exactly the socket's actual connected state right now —
+      // not an assumption that gets corrected later by a timeout.
+      status: isSocketConnected() ? 'pending' : 'queued',
     };
     setMessages((prev) => [...prev, optimistic]);
     scrollActionRef.current = 'bottom';
 
-    // Fire-and-forget emit — no promise to await, no try/catch here.
-    // Confirmation (or rejection) arrives later as a 'message_ack' or
-    // 'error' event carrying this same clientMessageId (handled in the
-    // effect above). This IS a real behavior change from the HTTP version:
-    // there is no synchronous "did this even reach the server" signal
-    // anymore, which is exactly why the timeout below exists — Phase 11's
-    // offline queue is the real, permanent fix for "the socket was down
-    // when I hit send," not this timeout. This is just a stopgap so a
-    // dropped message doesn't say "Sending…" forever in the meantime.
+    // No promise, no try/catch — sendChatMessage's job ends at "this is
+    // now durably queued," not "this is now confirmed." Every subsequent
+    // state transition (pending -> confirmed via message_ack, pending ->
+    // queued via a disconnect, queued -> pending via the next connect,
+    // queued/pending -> failed via a definitive error) is driven entirely
+    // by the socket event handlers registered above — there is no
+    // timeout anywhere in this path anymore. Phase 10 needed one because
+    // there was nothing else that would ever revisit a stuck 'pending'
+    // bubble; Phase 11's outbox is that revisiting mechanism, driven by
+    // real events instead of a guessed delay.
     sendChatMessage(roomId, body, clientMessageId);
-
-    window.setTimeout(() => {
-      setMessages((prev) =>
-        prev.map((m) =>
-          m.client_message_id === clientMessageId && 'status' in m && m.status === 'pending'
-            ? { ...m, status: 'failed' as const }
-            : m
-        )
-      );
-    }, SEND_ACK_TIMEOUT_MS);
   }
 
   if (isLoadingInitial) return <div className="boot-screen">Loading room…</div>;
