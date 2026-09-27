@@ -65,8 +65,18 @@ export function disconnectSocket(): void {
   socket = null;
 }
 
-export function joinRoom(roomId: number): void {
-  connectSocket().emit('join_room', { roomId });
+/**
+ * `sinceSequence` is optional (Phase 12 — ARCHITECTURE_V2.md §7): omit it
+ * for a room's very first-ever join, where there's no local history to
+ * catch up FROM yet (ChatRoomPage's initial HTTP load already fetched the
+ * latest page). Every other call site — every reconnect, and every
+ * follow-up page request for a large gap — passes the highest
+ * sequence_number this client has ever displayed for this room, so the
+ * server knows exactly what to send back in a 'catch_up' batch before
+ * live delivery resumes.
+ */
+export function joinRoom(roomId: number, sinceSequence?: number): void {
+  connectSocket().emit('join_room', { roomId, sinceSequence });
 }
 
 export function leaveRoom(roomId: number): void {
