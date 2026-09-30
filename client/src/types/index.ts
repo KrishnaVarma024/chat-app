@@ -72,3 +72,15 @@ export interface CatchUpBatch {
   hasMore: boolean;
   latestSequenceNumber: number;
 }
+
+// Phase 13 — ARCHITECTURE_V2.md §9. Reference-counted server-side: this
+// only ever arrives when a user's online sockets go from zero to one
+// (status: 'online') or one-to-zero AND the grace period elapses with no
+// reconnect (status: 'offline') — never once per socket. A client that
+// tracks a Set<userId> keyed by this event's userId already has correct
+// multi-tab/multi-device semantics for free, with no client-side reference
+// counting of its own to get wrong.
+export interface PresenceEvent {
+  userId: number;
+  status: 'online' | 'offline';
+}

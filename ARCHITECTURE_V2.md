@@ -387,6 +387,36 @@ This map is per-process, which is consistent with the single-instance
 assumption carried over from v1 (see §12 for what changes if that stops
 holding).
 
+**Implementation note (Phase 13):** `markOnline`/`markOffline` (both in
+`realtime/presence.ts`) are called from the connection handler and the
+`disconnect` handler in `realtime/socket.ts`, both fire-and-forget with a
+`.catch` — same posture as Phase 10/11's `usernameReady`, for the same
+reason: presence is best-effort, and an unawaited promise with no
+rejection handler is exactly the class of bug that crashed the whole
+process in Phase 11 (see §15). `markOnline` is deliberately chained onto
+`usernameReady` (`usernameReady.then(() => markOnline(...))`) rather than
+fired independently in the same tick — two unrelated DB reads landing at
+the literal same instant on a connection that's otherwise idle right then
+have no reason to race each other for a pool slot, and sequencing them
+costs a fraction of a millisecond while reducing DB contention right when
+it's most likely to spike (many reconnects landing at once after a
+restart). `broadcastPresence` reuses `listRoomsForUser` (already built for
+the HTTP `GET /rooms` list) exactly as-is — no new query.
+
+`pingInterval`/`pingTimeout` (§8) and the presence grace period are read
+from `env.ts`, overridable via `SOCKET_PING_INTERVAL_MS`,
+`SOCKET_PING_TIMEOUT_MS`, and `PRESENCE_GRACE_PERIOD_MS` — production
+keeps the documented 25s/20s/7s defaults; only a verification run
+overrides them, because proving "a dead connection is detected via
+heartbeat, not left hanging" for real means actually waiting out a
+timeout, and 25s+20s per check makes for a slow test suite. The
+verification script (`scripts/presence-test.mjs`) simulates a connection
+that goes dark without a clean close — the actual scenario §8 describes,
+not just a `socket.close()` — by pausing the raw WebSocket's underlying
+Node socket (`clientSocket.io.engine.transport.ws.pause()`) right after
+connecting: no close frame is ever sent, so only the server's own
+ping/pong timer ever notices anything is wrong.
+
 ## 10. Typing Indicators
 
 Typing events are ephemeral, high-frequency, and must never touch
