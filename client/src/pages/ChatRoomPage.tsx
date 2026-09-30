@@ -8,7 +8,7 @@ import { mergeMessages } from '../utils/mergeMessages';
 import { MessageItem } from '../components/MessageItem';
 import { MessageInput } from '../components/MessageInput';
 import { ApiError } from '../api/client';
-import type { CatchUpBatch, DisplayMessage, Message, OptimisticMessage, Room } from '../types';
+import type { CatchUpBatch, DisplayMessage, Message, OptimisticMessage, PresenceEvent, Room } from '../types';
 
 const NEAR_BOTTOM_THRESHOLD_PX = 100;
 const LOAD_OLDER_THRESHOLD_PX = 100;
@@ -20,6 +20,13 @@ export function ChatRoomPage() {
 
   const [room, setRoom] = useState<Room | null>(null);
   const [messages, setMessages] = useState<DisplayMessage[]>([]);
+  // Phase 13 — ARCHITECTURE_V2.md §9. Purely additive knowledge built from
+  // 'presence' broadcasts received since this component mounted — there is
+  // no initial "who's online right now" snapshot on join (out of scope for
+  // this phase), so a user who never sends a message and never changes
+  // status while this room is open simply never appears here. That's a
+  // known, deliberate gap (see the interview questions), not a bug.
+  const [onlineUserIds, setOnlineUserIds] = useState<Set<number>>(new Set());
   const [olderCursor, setOlderCursor] = useState<string | null>(null);
   const [hasMoreOlder, setHasMoreOlder] = useState(false);
   const [isLoadingInitial, setIsLoadingInitial] = useState(true);
@@ -54,6 +61,7 @@ export function ChatRoomPage() {
     let cancelled = false;
     setIsLoadingInitial(true);
     setMessages([]);
+    setOnlineUserIds(new Set());
     setError(null);
 
     (async () => {
@@ -176,6 +184,28 @@ export function ChatRoomPage() {
       }
     }
 
+    function handlePresence({ userId, status }: PresenceEvent) {
+      setOnlineUserIds((prev) => {
+        // Only construct a new Set when membership actually changes —
+        // matters here specifically because this runs on every presence
+        // broadcast for every room this socket is joined to, and an
+        // identical-looking Set object would still trigger a re-render if
+        // we always returned a fresh one.
+        const isMember = prev.has(userId);
+        if (status === 'online' && !isMember) {
+          const next = new Set(prev);
+          next.add(userId);
+          return next;
+        }
+        if (status === 'offline' && isMember) {
+          const next = new Set(prev);
+          next.delete(userId);
+          return next;
+        }
+        return prev;
+      });
+    }
+
     function handleSocketError(data: { error?: { code?: string; message?: string }; clientMessageId?: string }) {
       // Room-level errors (a bad join_room) don't carry a clientMessageId —
       // nothing to reconcile here, just a send_message failure.
@@ -192,6 +222,7 @@ export function ChatRoomPage() {
     socket.on('new_message', handleNewMessage);
     socket.on('message_ack', handleMessageAck);
     socket.on('catch_up', handleCatchUp);
+    socket.on('presence', handlePresence);
     socket.on('error', handleSocketError);
     // Already connected before this effect ran (e.g. navigating between
     // two rooms without ever losing the connection) — still passes
@@ -209,6 +240,7 @@ export function ChatRoomPage() {
       socket.off('new_message', handleNewMessage);
       socket.off('message_ack', handleMessageAck);
       socket.off('catch_up', handleCatchUp);
+      socket.off('presence', handlePresence);
       socket.off('error', handleSocketError);
       leaveRoom(roomId);
     };
@@ -311,6 +343,7 @@ export function ChatRoomPage() {
             message={m}
             isOwn={m.sender_id === user?.id}
             ownUsername={user?.username ?? ''}
+            isSenderOnline={onlineUserIds.has(m.sender_id)}
           />
         ))}
       </div>

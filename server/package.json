@@ -26,7 +26,8 @@
     "test:socket-foundation": "node scripts/socket-foundation-test.mjs",
     "test:socket-messaging": "node scripts/socket-messaging-test.mjs",
     "test:reconnect-queue": "node scripts/reconnect-queue-test.mjs",
-    "test:catchup": "node scripts/catchup-test.mjs"
+    "test:catchup": "node scripts/catchup-test.mjs",
+    "test:presence": "node scripts/presence-test.mjs"
   },
   "dependencies": {
     "bcrypt": "^6.0.0",

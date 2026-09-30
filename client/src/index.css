@@ -253,6 +253,19 @@ a {
   color: #b45309;
 }
 
+.presence-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  align-self: center;
+  background: #d1d5db; /* offline / unknown */
+}
+
+.presence-dot.online {
+  background: #22c55e;
+}
+
 .message-input {
   display: flex;
   gap: 0.5rem;
