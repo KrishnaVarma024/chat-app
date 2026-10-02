@@ -116,3 +116,20 @@ export function sendChatMessage(roomId: number, body: string, clientMessageId: s
 export function isSocketConnected(): boolean {
   return socket?.connected ?? false;
 }
+
+/**
+ * Typing indicators (Phase 14 — ARCHITECTURE_V2.md §10) deliberately get NO
+ * outbox treatment, unlike sendChatMessage. A typing event that fails to
+ * reach the server because the socket is disconnected isn't something
+ * worth queueing and replaying later — by the time a reconnect happens,
+ * "I was typing a few seconds ago" is meaningless. getSocket() (not
+ * connectSocket()) reflects that: if there's no live connection, this is
+ * silently a no-op rather than forcing one into existence.
+ */
+export function emitTypingStart(roomId: number): void {
+  getSocket()?.emit('typing_start', { roomId });
+}
+
+export function emitTypingStop(roomId: number): void {
+  getSocket()?.emit('typing_stop', { roomId });
+}
