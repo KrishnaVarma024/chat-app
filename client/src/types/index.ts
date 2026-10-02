@@ -84,3 +84,14 @@ export interface PresenceEvent {
   userId: number;
   status: 'online' | 'offline';
 }
+
+// Phase 14 — ARCHITECTURE_V2.md §10. Identical shape for both 'typing' and
+// 'stopped_typing' — deliberately minimal (no username, no timestamp): the
+// server is a pure relay with zero DB access on this path, so it has
+// nothing more to attach than what the sender itself sent. The receiving
+// client resolves a display name itself, best-effort, from messages it has
+// already seen from that sender (see ChatRoomPage's resolveDisplayName).
+export interface TypingEvent {
+  userId: number;
+  roomId: number;
+}

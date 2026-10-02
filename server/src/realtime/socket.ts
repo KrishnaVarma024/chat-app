@@ -4,6 +4,7 @@ import { env } from '../config/env';
 import { socketAuthMiddleware, type AuthedSocketData } from './socketAuth.middleware';
 import { registerRoomHandlers } from './rooms.socket';
 import { registerMessageHandlers } from './messages.socket';
+import { registerTypingHandlers } from './typing.socket';
 import { markOnline, markOffline } from './presence';
 import { findUserById } from '../db/users.repo';
 import { logger } from '../observability/logger';
@@ -102,6 +103,7 @@ export function attachSocketServer(httpServer: HttpServer): Server {
 
     registerRoomHandlers(io, socket);
     registerMessageHandlers(io, socket);
+    registerTypingHandlers(io, socket);
 
     // Fire-and-forget, same posture as usernameReady above: presence is a
     // best-effort broadcast, not something any caller here needs to await

@@ -438,6 +438,53 @@ information that's meaningless five seconds later.
   the receiver's own timeout is the thing that guarantees this, not
   trusting the sender to always clean up after itself.
 
+**Implementation note (Phase 14):** `typing.socket.ts` is deliberately the
+thinnest handler file in the project — no repo import, no pool import, not
+even `checkRoomMembership` — but "no database access" doesn't mean "no
+authorization check." `socket.to(roomName)` broadcasts to an arbitrary
+room-name string regardless of whether the *sending* socket itself ever
+joined that room, so a connected-but-unrelated client who simply knows (or
+guesses) another room's numeric id could otherwise spoof a typing
+indicator into a room they were never authorized to know exists. The fix
+costs nothing extra: `socket.rooms` is Socket.IO's own in-memory `Set` of
+rooms this socket has actually `join()`-ed, already populated by
+`join_room`'s real, DB-backed membership check earlier in the connection's
+life. Checking `socket.rooms.has(roomKey(roomId))` is a plain in-memory
+lookup — zero added DB cost — while still closing the spoofing gap, since
+only a socket that already passed `join_room`'s check can be in that Set.
+There is deliberately no `disconnect`-triggered cleanup emitting a
+synthetic `stopped_typing` — that responsibility sits entirely with the
+receiving client's own auto-clear timeout described above, which already
+has to handle "sender vanished without warning" unconditionally; a second,
+server-side mechanism attempting the same cleanup couldn't distinguish a
+genuine crash from a network blip about to recover, for a feature where
+being briefly wrong costs nothing.
+
+The receiving-client auto-clear timer itself was pulled out of
+`ChatRoomPage.tsx` into its own framework-free module
+(`client/src/realtime/typingTracker.ts`), the same move Phase 11 made for
+the outbox — this logic is pure bookkeeping around timers and a `Set` with
+nothing React-specific about it, and leaving it as inline closures inside
+a `useEffect` would mean the only way to test the actual DoD (the
+auto-clear guarantee) is driving a fully mounted component through fake
+timers. The extracted module is driven directly and deterministically in
+`typingTracker.test.ts` (9 cases, `vi.useFakeTimers()`), including the
+one that matters most: a user who never sends `stopped_typing` still
+clears after the timeout, and a sustained typing burst keeps resetting
+the clock instead of flickering off mid-sentence.
+
+`scripts/typing-test.mjs` proves the server-observable half of the
+contract — relay correctness, the authorization gate rejecting a
+never-joined socket with `FORBIDDEN`, and a burst of `typing_start`/
+`typing_stop` leaving the room's message count and latest sequence number
+completely unchanged, checked through the same public
+`GET /rooms/:roomId/messages` endpoint a real client's scrollback would
+use rather than a second direct database connection — this sandbox's
+PGlite stand-in tolerates a second simultaneous raw connection poorly
+(reproduced independently with `concurrency-test.mjs`), never a real
+Postgres behavior, and proving the claim through the public API surface
+is a strictly black-box-stronger check anyway.
+
 ## 11. Rate Limiting on the Socket Layer
 
 v1's token-bucket limiter (Phase 7) is per-user, in-process, and was

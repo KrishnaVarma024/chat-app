@@ -3,12 +3,30 @@ import { Link, useParams } from 'react-router-dom';
 import { useAuth } from '../auth/AuthContext';
 import { getRoom } from '../api/rooms';
 import { fetchOlderMessages, fetchLatestMessages } from '../api/messages';
-import { connectSocket, isSocketConnected, joinRoom, leaveRoom, sendChatMessage } from '../realtime/socket';
+import {
+  connectSocket,
+  emitTypingStart,
+  emitTypingStop,
+  isSocketConnected,
+  joinRoom,
+  leaveRoom,
+  sendChatMessage,
+} from '../realtime/socket';
 import { mergeMessages } from '../utils/mergeMessages';
+import { createTypingTracker } from '../realtime/typingTracker';
 import { MessageItem } from '../components/MessageItem';
 import { MessageInput } from '../components/MessageInput';
 import { ApiError } from '../api/client';
-import type { CatchUpBatch, DisplayMessage, Message, OptimisticMessage, PresenceEvent, Room } from '../types';
+import type { CatchUpBatch, DisplayMessage, Message, OptimisticMessage, PresenceEvent, Room, TypingEvent } from '../types';
+
+// ARCHITECTURE_V2.md §10's receiving-client safety net: auto-clear a
+// user's typing indicator if no FURTHER typing_start arrives within this
+// window, regardless of whether typing_stop ever shows up. This is what
+// stops a sender who crashes or loses their connection mid-keystroke
+// (never gets a chance to emit typing_stop) from leaving a permanently
+// stuck "X is typing…" on everyone else's screen — the receiver's own
+// timeout owns this guarantee, not trust in the sender's cleanup.
+const TYPING_AUTO_CLEAR_MS = 5000;
 
 const NEAR_BOTTOM_THRESHOLD_PX = 100;
 const LOAD_OLDER_THRESHOLD_PX = 100;
@@ -27,6 +45,17 @@ export function ChatRoomPage() {
   // status while this room is open simply never appears here. That's a
   // known, deliberate gap (see the interview questions), not a bug.
   const [onlineUserIds, setOnlineUserIds] = useState<Set<number>>(new Set());
+  // Who's currently shown as typing in THIS room, built entirely from
+  // 'typing'/'stopped_typing' events — same "no initial snapshot, purely
+  // additive from events seen since mount" shape as onlineUserIds above.
+  const [typingUserIds, setTypingUserIds] = useState<Set<number>>(new Set());
+  // The actual timer/membership bookkeeping lives in typingTracker.ts, not
+  // here — this ref holds one tracker instance for the component's
+  // lifetime; setTypingUserIds is its onChange callback, so the tracker's
+  // internal state and this component's rendered state can never drift
+  // apart. See typingTracker.test.ts for the auto-clear guarantee itself;
+  // this component only ever calls markTyping/markStopped/reset.
+  const typingTrackerRef = useRef(createTypingTracker((ids) => setTypingUserIds(ids), TYPING_AUTO_CLEAR_MS));
   const [olderCursor, setOlderCursor] = useState<string | null>(null);
   const [hasMoreOlder, setHasMoreOlder] = useState(false);
   const [isLoadingInitial, setIsLoadingInitial] = useState(true);
@@ -62,6 +91,7 @@ export function ChatRoomPage() {
     setIsLoadingInitial(true);
     setMessages([]);
     setOnlineUserIds(new Set());
+    typingTrackerRef.current.reset();
     setError(null);
 
     (async () => {
@@ -206,6 +236,19 @@ export function ChatRoomPage() {
       });
     }
 
+    function handleTyping({ userId: typingUserId, roomId: eventRoomId }: TypingEvent) {
+      // Same defensive room-scoping as handleCatchUp (Phase 12) — this
+      // socket is a global singleton, a stale event for a room this
+      // component has already navigated away from should be a no-op here.
+      if (eventRoomId !== roomId) return;
+      typingTrackerRef.current.markTyping(typingUserId);
+    }
+
+    function handleStoppedTyping({ userId: typingUserId, roomId: eventRoomId }: TypingEvent) {
+      if (eventRoomId !== roomId) return;
+      typingTrackerRef.current.markStopped(typingUserId);
+    }
+
     function handleSocketError(data: { error?: { code?: string; message?: string }; clientMessageId?: string }) {
       // Room-level errors (a bad join_room) don't carry a clientMessageId —
       // nothing to reconcile here, just a send_message failure.
@@ -223,6 +266,8 @@ export function ChatRoomPage() {
     socket.on('message_ack', handleMessageAck);
     socket.on('catch_up', handleCatchUp);
     socket.on('presence', handlePresence);
+    socket.on('typing', handleTyping);
+    socket.on('stopped_typing', handleStoppedTyping);
     socket.on('error', handleSocketError);
     // Already connected before this effect ran (e.g. navigating between
     // two rooms without ever losing the connection) — still passes
@@ -241,7 +286,15 @@ export function ChatRoomPage() {
       socket.off('message_ack', handleMessageAck);
       socket.off('catch_up', handleCatchUp);
       socket.off('presence', handlePresence);
+      socket.off('typing', handleTyping);
+      socket.off('stopped_typing', handleStoppedTyping);
       socket.off('error', handleSocketError);
+      // Leaving the room (or this effect re-running for a different
+      // roomId) should not leave an auto-clear timer running for a typing
+      // indicator this component no longer renders — the reset at the top
+      // of the initial-load effect handles the "switched rooms" case
+      // already, but this covers the plain unmount case too.
+      typingTrackerRef.current.reset();
       leaveRoom(roomId);
     };
   }, [roomId, isLoadingInitial]);
@@ -322,6 +375,19 @@ export function ChatRoomPage() {
     sendChatMessage(roomId, body, clientMessageId);
   }
 
+  // Best-effort only — the typing payload itself carries nothing but a
+  // userId (ARCHITECTURE_V2.md §10 keeps the relay minimal), so a name is
+  // recovered from whatever this client has already rendered FROM that
+  // sender. A user who's typing but has never sent a message in this
+  // client's current view shows as "User #id", same fallback MessageItem
+  // already uses for the identical "we don't know their name yet" case.
+  function resolveDisplayName(senderId: number): string {
+    const seen = messages.find((m) => m.sender_id === senderId);
+    return seen?.sender_username ?? `User #${senderId}`;
+  }
+
+  const typingNames = Array.from(typingUserIds).map(resolveDisplayName);
+
   if (isLoadingInitial) return <div className="boot-screen">Loading room…</div>;
 
   return (
@@ -348,7 +414,17 @@ export function ChatRoomPage() {
         ))}
       </div>
 
-      <MessageInput onSend={handleSend} />
+      {typingNames.length > 0 && (
+        <p className="typing-indicator">
+          {typingNames.join(', ')} {typingNames.length === 1 ? 'is' : 'are'} typing…
+        </p>
+      )}
+
+      <MessageInput
+        onSend={handleSend}
+        onTypingStart={() => emitTypingStart(roomId)}
+        onTypingStop={() => emitTypingStop(roomId)}
+      />
     </div>
   );
 }
