@@ -47,6 +47,27 @@ describe('typingTracker', () => {
     expect(onChange).toHaveBeenCalledTimes(callsBeforeAdvance);
   });
 
+  // Exercise M3 (Phase 14 exercises): calling markStopped a SECOND time
+  // for a user who's already been removed must be just as harmless as
+  // calling it for someone who was never typing — the real server-side
+  // sequence this guards against is a double typing_stop arriving (e.g.
+  // once from blur, once from the idle debounce firing a moment later),
+  // which should never produce a second onChange call or any error.
+  it('calling markStopped twice in a row for the same user is idempotent — only the first call notifies', () => {
+    const onChange = vi.fn();
+    const tracker = createTypingTracker(onChange, AUTO_CLEAR_MS);
+
+    tracker.markTyping(1);
+    onChange.mockClear();
+
+    tracker.markStopped(1);
+    expect(onChange).toHaveBeenCalledTimes(1);
+    expect(onChange).toHaveBeenLastCalledWith(new Set());
+
+    tracker.markStopped(1); // already gone — must be a true no-op
+    expect(onChange).toHaveBeenCalledTimes(1); // no second call
+  });
+
   it('markStopped for a user who was never typing is a harmless no-op', () => {
     const onChange = vi.fn();
     const tracker = createTypingTracker(onChange, AUTO_CLEAR_MS);

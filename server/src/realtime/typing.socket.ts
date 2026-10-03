@@ -2,6 +2,43 @@ import type { Server, Socket } from 'socket.io';
 import { ValidationError, ForbiddenError } from '../errors';
 import { roomKey, emitError } from './rooms.socket';
 import type { AuthedSocketData } from './socketAuth.middleware';
+import { TokenBucket } from '../rateLimit/tokenBucket';
+
+/**
+ * Phase 14 exercise M1 (ahead of Phase 15's full hardening pass):
+ * typing_start has no natural ceiling the way send_message does. A human
+ * sending messages is already rate-limited by their own typing speed; a
+ * buggy or malicious client emitting typing_start on every keystroke with
+ * no client-side throttle has no such ceiling, and unlike a message send
+ * it fans out to every OTHER socket in the room on every single emit —
+ * the cheaper-to-send, more expensive-to-ignore flood vector described in
+ * ARCHITECTURE_V2.md §11.
+ *
+ * Keyed by userId, not socket.id, so multiple tabs/devices for the same
+ * user share one budget rather than each getting their own free ride —
+ * same keying choice as the Express rate limiter (rateLimit.middleware.ts).
+ * A process-local Map, same documented single-instance limitation as that
+ * limiter (ARCHITECTURE_V2.md §12) — not shared across a horizontally
+ * scaled deployment.
+ *
+ * Capacity/refill is deliberately generous relative to the client's own
+ * ~2s throttle (MessageInput.tsx): 10 tokens, refilling at 2/second, means
+ * normal usage (one start roughly every 2s, occasional starts+stops close
+ * together) never comes close to exhausting it, while a client ignoring
+ * its own throttle entirely gets capped hard after one burst.
+ */
+const TYPING_BUCKET_CAPACITY = 10;
+const TYPING_BUCKET_REFILL_PER_SECOND = 2;
+const typingBuckets = new Map<number, TokenBucket>();
+
+function typingBucketFor(userId: number): TokenBucket {
+  let bucket = typingBuckets.get(userId);
+  if (!bucket) {
+    bucket = new TokenBucket(TYPING_BUCKET_CAPACITY, TYPING_BUCKET_REFILL_PER_SECOND / 1000);
+    typingBuckets.set(userId, bucket);
+  }
+  return bucket;
+}
 
 /**
  * Typing indicators: ARCHITECTURE_V2.md §10. A pure relay — no database
@@ -45,6 +82,14 @@ export function registerTypingHandlers(_io: Server, socket: Socket): void {
   socket.on('typing_start', (payload: { roomId?: number }) => {
     const roomId = requireJoinedRoom(payload);
     if (roomId === null) return;
+    // On exhaustion: drop silently, don't emit a 'rate_limited' error the
+    // way send_message does. send_message's caller needs to know their
+    // message didn't go through; a dropped typing_start has no equivalent
+    // stakes, and echoing an error back to an already-flooding client is
+    // itself more traffic for a feature where silence costs nothing — the
+    // receiving side's indicator just won't refresh for this burst, which
+    // is indistinguishable from the sender having briefly paused.
+    if (!typingBucketFor(userId).tryConsume()) return;
     // socket.to(...), not io.to(...) — excludes the sender, same reasoning
     // as new_message's broadcast (Phase 10): you already know you're
     // typing, you don't need an echo of your own event.
@@ -54,6 +99,10 @@ export function registerTypingHandlers(_io: Server, socket: Socket): void {
   socket.on('typing_stop', (payload: { roomId?: number }) => {
     const roomId = requireJoinedRoom(payload);
     if (roomId === null) return;
+    // Same shared bucket as typing_start, not a separate one — otherwise a
+    // client could double its effective budget by alternating which event
+    // it spams.
+    if (!typingBucketFor(userId).tryConsume()) return;
     socket.to(roomKey(roomId)).emit('stopped_typing', { userId, roomId });
   });
 
