@@ -480,7 +480,7 @@ deterministically (`realtime.catchup.ordering`: a gate on the first
 the model-based test (`catchUpCursor.model.test.ts`: seeded random interleavings
 of appends, drops, pages and swapped pushes, with the invariant checked after
 **every** step - about a third of seeds break the old cursor, the shortest
-counterexample is seven steps). The watermark removes the class rather than
+counterexample is six steps). The watermark removes the class rather than
 patching the instance: there is no "unsafe input" left to guard against,
 because nothing but an authoritative page can move the cursor past a hole.
 
