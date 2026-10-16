@@ -3,7 +3,7 @@
 A real-time chat app (users, rooms, messages) built around
 **message-delivery correctness** rather than CRUD breadth: gap-free per-room
 sequence numbers, cursor (never offset) pagination, JWT refresh-token rotation
-with reuse detection — and, in v2, a Socket.IO transport on top that is
+with reuse detection and, in v2, a Socket.IO transport on top that is
 designed to survive the things real networks do: dropped connections, silent
 network death, token expiry mid-conversation, and server restarts.
 
@@ -13,7 +13,7 @@ thrown away: the sockets call the same functions the HTTP routes do, so
 authorization, idempotency and ordering have exactly one implementation.
 
 **Deployed on Render** (free tier, so the API cold-starts in about a minute
-after 15 idle minutes — expected, not a bug): client
+after 15 idle minutes  expected, not a bug): client
 [chat-app-client-j5j9.onrender.com](https://chat-app-client-j5j9.onrender.com),
 API [chat-app-server-j0mr.onrender.com](https://chat-app-server-j0mr.onrender.com)/health.
 See [`DEPLOYMENT.md`](./DEPLOYMENT.md) — including the free-database expiry
