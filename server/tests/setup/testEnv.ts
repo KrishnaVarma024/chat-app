@@ -16,6 +16,10 @@ export const TEST_ENV = {
   CORS_ORIGIN: 'http://localhost:5173',
   NODE_ENV: 'test',
   PORT: '4999',
+  // PGlite serves ONE connection at a time; a pool of one makes the pool
+  // serialize the overlapping queries a realtime test inherently produces
+  // (see the dbPoolMax comment in src/config/env.ts).
+  DB_POOL_MAX: '1',
 } as const;
 
 export const TEST_DB_PORT = 5544;

@@ -349,29 +349,78 @@ socket.emit("join_room", { roomId, sinceSequence: 482 });
 
 The server runs **the same cursor query v1's poll route already uses**
 (`sequence_number > $sinceSequence`, ordered ascending, paginated by the
-same `limit`/`has_more` convention) and emits the result as a single
-`catch_up` batch *before* the socket starts receiving live `new_message`
-events for that room:
+same `limit`/`has_more` convention) and emits the result as a `catch_up`
+batch. The order of operations inside `join_room` is the whole subtlety:
 
 ```
 1. client rejoins, sends sinceSequence: 482
-2. server: SELECT ... WHERE room_id = $1 AND sequence_number > 482 ORDER BY sequence_number ASC
-3. server emits catch_up: { messages: [...], latestSequenceNumber: 491 }
-4. server socket.join(roomId) — only now does live new_message delivery begin
+2. server: membership check
+3. server socket.join(room)                 <- live delivery starts HERE
+4. server: SELECT ... WHERE sequence_number > 482 ORDER BY sequence_number LIMIT 51
+5. server emits catch_up: { messages: [...], hasMore, latestSequenceNumber }
+6. server emits joined_room
 ```
 
-Ordering the catch-up *before* joining the live room is what prevents a
-gap or a duplicate at the seam: if `socket.join` happened first, a
-message sent between steps 1 and 3 could arrive as both a live event and
-part of the catch-up batch. Joining last guarantees the catch-up query's
-own snapshot is the only source for anything up to that point, and live
-events are the only source for anything after.
+**Join first, query second — and this is a correction.** The Phase 12
+implementation did it the other way round (query, emit, *then* join), on the
+reasoning that joining first lets a message arrive twice, once live and once
+inside the batch. Phase 16's seam test falsified the premise: the two failure
+modes are not symmetric.
+
+| Order | A message committed in the gap | Result |
+|---|---|---|
+| query, then join | after the query's snapshot, before the join | in **neither** the batch nor the live stream — silently lost |
+| join, then query | any time after the join | pushed live, and/or included in the batch (the query runs after the join) — at worst **twice** |
+
+A duplicate is invisible: every client dedupes by `client_message_id`
+(`mergeMessages`). A gap is silent data loss that nothing ever repairs,
+because the client has no reason to look. The window is a few milliseconds
+wide in production, which is exactly why it survived: it needs a message to
+land in it, and no happy-path demo ever has. The regression test
+(`realtime.catchup.test.ts`, "a message committed BETWEEN the catch-up query
+and the join") opens that window deterministically by letting the real query
+run and then sending a message *before* its result is handed back; against
+the old order Bob's view is `[1, 2, 3]` and message `4` is missing.
+
+The consequence of joining first is that a live `new_message` can now arrive
+**before** the `catch_up` batch it overlaps. That is harmless to display
+(sorted merge, deduped), but it is not harmless to the *cursor*, which is the
+second half of the correction.
+
+### The client cursor (`client/src/realtime/catchUpCursor.ts`)
+
+"The highest `sequence_number` I have seen" is the obvious value to send as
+`sinceSequence`, and it is wrong the moment live pushes and catch-up pages
+interleave. The invariant the client actually needs is stronger:
+
+> every message with `sequence_number <= cursor` is already known.
+
+A catch-up page is a contiguous range, so advancing to its
+`latestSequenceNumber` preserves that. A live push is **one** message that
+may be far ahead; advancing to it while a multi-page catch-up is still in
+flight declares the whole range in between "known", and the next page request
+(or the next reconnect) skips it forever. So:
+
+- live pushes and the acks of our own sends advance the cursor **only when no
+  catch-up is in flight**;
+- follow-up pages continue from the **previous page's own end**, never from
+  the overall high-water mark;
+- a disconnect mid-chain leaves the cursor where it was, so the reconnect
+  asks for the unfinished range again.
+
+This is a dependency-free class (`CatchUpCursor`) precisely because it is the
+one piece of client logic whose bugs lose messages silently. It is unit-tested
+directly, and the server integration suite drives the *shipped* class against
+the real server (`RoomFollower` in the test harness), so the two halves of the
+protocol are tested together rather than each against the other's imagined
+behaviour.
 
 If `has_more` comes back true (the client was offline long enough that
 more than one page of history piled up), the client immediately requests
 the next page with the same mechanism, exactly as v1's poll route did —
 catching up in a couple of round trips instead of ever silently dropping
-messages older than the last page fetched.
+messages older than the last page fetched. (From the previous page's end —
+see the cursor rules below.)
 
 **Implementation note (Phase 12):** "the same mechanism" turned out to
 mean, literally, re-emitting `join_room` itself — not a second dedicated
@@ -379,21 +428,33 @@ event. `socket.join()` on a room this socket already belongs to is a
 harmless no-op (Socket.IO's own join bookkeeping is a `Set` under the
 hood), so a follow-up page request for a large gap and a brand-new join
 are indistinguishable to the server: both just run the catch-up query
-against whatever `sinceSequence` was sent and emit a `catch_up` batch
-before touching membership. One event, one code path, instead of a
-second event that would have to duplicate the membership check and the
-join-ordering guarantee.
+against whatever `sinceSequence` was sent and emit a `catch_up` batch. One
+event, one code path, instead of a second event that would have to
+duplicate the membership check and the join-ordering guarantee.
 
-Client-side, `ChatRoomPage.tsx` tracks the highest `sequence_number` it
-has ever displayed for the room in a ref (not state — it's read inside
-socket event-handler closures and needs its value at call time, not
-whatever a render closed over). That ref is seeded from the initial HTTP
-page's `latest_sequence_number` and updated on every `new_message`,
-`message_ack`, and `catch_up` batch — so the exact same value flows into
-`join_room` whether this is the very first join, a reconnect after a
-network drop, or a follow-up page request for `has_more: true`. There is
-deliberately no special-cased "first join" branch beyond the ref simply
-starting from wherever the HTTP load left off.
+Client-side, `ChatRoomPage.tsx` holds a `CatchUpCursor` in a ref (not
+state — it is read inside socket event-handler closures and needs its value
+at call time, and changing it must never trigger a render). It is seeded from
+the initial HTTP page's `latest_sequence_number`, so the same `beginJoin()`
+value flows into `join_room` whether this is the first join, a reconnect
+after a network drop, or a follow-up page.
+
+**Known limits (deliberate, documented, not hidden).**
+
+- *Out-of-order live delivery.* Two senders' handlers can broadcast in a
+  different order than their commits. If a client receives `11` before `10`
+  and the connection drops in that instant, the cursor (`11`) skips `10`.
+  Closing this needs per-message gap detection, which the server's own
+  sequence counter makes harder than it looks: a duplicate retry *burns* a
+  sequence number (Phase 4: the counter commits even when the insert is a
+  no-op), so a "gap" in the sequence is not reliably a "missed message". The
+  honest fixes are to stop burning numbers on duplicates, or to have the
+  client always re-fetch a short overlap window below its cursor. Neither was
+  needed to meet this phase's done-when, so neither is built.
+- *A throw after the join.* If the catch-up query fails after `socket.join`,
+  the client receives an `error` and has live delivery but no batch; the next
+  reconnect repairs it. That is preferable to the reverse (a batch, but no
+  live stream).
 
 ## 8. Heartbeat & Dead-Connection Detection
 
@@ -664,40 +725,120 @@ swap, and `BucketStore` is the seam.
 
 ## 13. Testing Strategy for Realtime
 
-supertest (v1's integration-test tool) wraps Express directly via
-Node's `http` module without a listening port — that doesn't work for
-sockets, which need an actual TCP/WebSocket connection to test for real.
-v2's suite instead binds the Socket.IO server to an ephemeral port and
-drives it with `socket.io-client` as a genuine client, against the same
-PGlite-backed harness v1 already built:
+*As built in Phase 16.* supertest (v1's tool) wraps Express without binding a
+port — fine for HTTP, useless for sockets, where the connection **is** the
+thing under test. v2's suite binds the real Express + Socket.IO stack to an
+ephemeral port and drives it with `socket.io-client` as a genuine client,
+against the same PGlite-backed database v1 built. `cd server && npm test`
+runs all of it in one command (17 files, 89 tests, ~55s).
 
-```ts
-const httpServer = createServer(app);
-const io = attachSocketServer(httpServer);
-await new Promise<void>((resolve) => httpServer.listen(0, resolve));
-const port = (httpServer.address() as AddressInfo).port;
-const client = ioClient(`http://localhost:${port}`, { auth: { token } });
-```
+### The harness (`server/tests/helpers/realtimeHarness.ts`)
 
-Scenarios that specifically need this, not just unit-level assertions:
+- **`startRealtimeServer({ env, port })`** builds a server from a *fresh module
+  graph* (`vi.resetModules()` + dynamic import). `env.ts` reads `process.env`
+  once at import time, and several modules hold process-wide state (the
+  presence map, rate-limit buckets, the shutdown flag, the pg pool). A test
+  that needs a 300ms presence grace period or a 4-second token must set those
+  variables *before* the graph first loads, and must get pristine state so a
+  spent bucket or a flipped shutdown flag cannot leak into the next server. A
+  fresh graph per server is also what lets the shutdown test run an "old
+  instance" and a "new instance" side by side in one process.
+- **`TestClient`** wraps a `socket.io-client` socket and *records* every event.
+  `take(event)` consumes the first match, whether it arrived before or after
+  the call. (The classic flaky-realtime-test bug is registering a one-shot
+  listener after the event already fired.) `collect(event, windowMs)` waits a
+  bounded quiet window and returns what arrived — that is how a **negative**
+  ("Bob receives nothing") is asserted without hoping.
+- **`RoomFollower`** is the client half of the catch-up protocol, built on the
+  *shipped* `CatchUpCursor`; the reauth and shutdown suites likewise attach the
+  *shipped* `attachConnectionLifecycle` to the test socket. The tests therefore
+  exercise the real client policy against the real server, not a test author's
+  idea of either.
+- **`startProxy()`** is a TCP proxy you can `blackhole()` (swallow bytes while
+  keeping both sockets open — a silent network death, the only thing that
+  proves *heartbeat* detection), `cutAll()` (a connection that vanishes with
+  no notice), and `setTarget()` (retarget new connections — a platform router
+  shifting traffic to a new instance mid-deploy).
+- **`DB_POOL_MAX=1`** for the test pool. PGlite serves one connection at a time,
+  and a realtime test inherently overlaps queries (a connection's username
+  lookup, its presence lookup, the client's first `join_room`). A pool of one
+  makes the pool serialize them instead of failing with "Connection terminated
+  unexpectedly". Production keeps 10.
 
-- **Reconnect-and-replay, proven exactly-once**: kill the connection
-  mid-send, verify the message queues locally, reconnects, replays, and
-  ends up in the database (and rendered) **exactly once** — not "it
-  eventually arrives," but specifically that idempotency prevented a
-  duplicate on replay.
-- **Catch-up correctness**: disconnect a client, send messages from
-  another client while it's gone, reconnect, and assert the exact
-  missed set arrives with no gaps and no duplicates against what a live
-  client received in real time.
-- **Presence reference counting**: two sockets for the same user, close
-  one, assert still online; close both, assert offline only after the
-  grace period.
-- **Deterministic backoff**: reconnection delay math is timing-based,
-  which makes it either slow (real waits) or flaky (racing real timers)
-  to test naively. Use fake timers (`vi.useFakeTimers()`) to advance
-  virtual time and assert the sequence and growth of retry delays
-  without a slow or flaky test.
+### What each suite proves
+
+| File | Proves |
+|---|---|
+| `realtime.messaging` | handshake auth (no/garbage token refused, no server socket created); polling → WebSocket upgrade; ack to sender + push to others with the same row and consecutive sequences; non-members refused on join *and* send, and hear nothing; typing relayed, never echoed, refused for an unjoined room |
+| `realtime.replay` | **reconnect-and-replay, exactly once.** A resent id returns the *original* row; a message cut mid-flight at 0/3/10/30 ms lands exactly once whichever side of the commit the cut fell on; five messages queued offline replay in order on reconnect, once each, even when the flush runs twice (a reconnect storm) |
+| `realtime.catchup` | **catch-up correctness.** A 120-message gap arrives complete, ordered, in exactly three pages with no duplicates, then live delivery resumes; a dropped client receives exactly what it missed; **a message committed between the catch-up query and the join is not lost** (the seam, §7); live pushes interleaved with a multi-page catch-up never make the client skip a page; bad cursors → `VALIDATION_ERROR`; non-members get no batch; other rooms never leak |
+| `realtime.presence` | **reference counting.** Two sockets, one user: online once; closing one changes nothing; closing the last goes offline only after the grace period. A reconnect inside the grace period broadcasts *nothing*. A silently dead connection (proxy blackhole) is detected by heartbeat (`ping timeout`) and then goes offline. Presence reaches only people sharing a room |
+| `realtime.ratelimit` | a flood gets **one** `rate_limited` notice, the connection survives, refused sends never reach the database, and the advertised `retryAfterSeconds` is honest; the budget belongs to the *user* (a second tab gets no fresh allowance); HTTP and socket spend from one send budget |
+| `realtime.reauth` | the real client lifecycle refreshes and reauths **on the same socket**, outlives its original token and re-arms for the next one (one connect event, ever); a client that ignores the warning is disconnected at expiry and cannot return with that token; a reauth with another user's token → `FORBIDDEN` and drop; garbage → `UNAUTHORIZED` without killing a valid socket |
+| `realtime.shutdown` | a rolling deploy: clients are told, reconnect **immediately** to the new instance (inside the configured backoff) and lose nothing; the contrast case (no notice) waits the full backoff yet still catches up; one mute client cannot hold shutdown past the ack timeout; `/health` is `503` and new connections are refused once draining starts |
+| `smokeLive.script` | runs `scripts/smoke-live.mjs` against a local server, so the production smoke script cannot rot between deploys |
+
+Client side (`cd client && npm test`): `catchUpCursor.test.ts` (the cursor
+invariants), `reconnectionOptions.test.ts` (below), plus the existing outbox,
+typing, lifecycle and merge suites.
+
+### Deterministic backoff (`reconnectionOptions.test.ts`)
+
+Backoff is the textbook thing that is either slow to test (the schedule reaches
+30s) or flaky (racing real timers). The test builds the **real** Socket.IO
+`Manager` from the app's **real** options (`RECONNECTION_OPTIONS`, extracted so
+the numbers cannot drift from the test), replaces only its network step with
+one that fails instantly, pins `Math.random`, and advances virtual time with
+`vi.useFakeTimers()`. Every assertion is on exact milliseconds and the file
+runs in ~40ms of real time. It asserts: the schedule `1s, 2s, 4s, 8s, 16s,
+30s, 30s…`; nothing fires at 999ms; a hundred failures are all rescheduled
+(never gives up); a success resets the schedule; for 100 evenly spaced random
+draws every delay stays within ±50% of nominal and never exceeds the 30s cap;
+two clients disconnected at the same instant do not retry at the same instant
+(the thundering-herd defence); and — through the real lifecycle — a
+`server_shutdown` notice makes the *first* retry immediate while the next one
+waits the normal (doubled) delay, with the configured delay restored.
+
+### Does the suite catch what it claims to? (mutation checks)
+
+A test that has never been seen to fail proves little. These were verified by
+breaking the code they guard and watching the right test go red:
+
+| Mutation | Test that caught it |
+|---|---|
+| join *after* the catch-up query (the Phase 12 order) | `catchup` seam test: `[1,2,3]` vs `[1,2,3,4]` |
+| follow-up pages cursor from the high-water mark, not the page end | `catchup` interleave test (times out waiting for pages that were skipped) |
+| presence broadcasts offline when *any* socket leaves | `presence` reference-counting test |
+| rate-limit bucket keyed by socket instead of user | `ratelimit` per-user budget **and** HTTP/socket shared-budget tests |
+| a reauth that is acknowledged but does not re-arm the expiry timers | `reauth` same-socket survival test |
+| the insert ignores the client's `client_message_id` (idempotency defeated) | all three `replay` tests |
+| jitter turned off / delay cap changed | `reconnectionOptions` herd and schedule tests |
+
+Not every test has been mutation-checked — the shutdown, typing and messaging
+suites have not — so treat the table as "these are proven to bite", not "the
+rest are proven not to".
+
+### Production verification (`server/scripts/smoke-live.mjs`)
+
+Local testing has no hosting proxy, and a proxy that does not forward the
+`Upgrade` header leaves an app "working" on long-polling forever — slower and
+chattier, with no error anywhere. So the final check is against the *real
+deployment*: `npm run smoke:live -- https://<your-api>` creates two throwaway
+accounts and a room and verifies, through the real proxy: the polling →
+WebSocket **upgrade**, pushed delivery with latency, typing, presence
+online/offline (the real 7s grace), idempotent resend, reconnect + exact
+catch-up, and that a flood gets `rate_limited` without a disconnect.
+`--watch-deploy` holds a connection open while you trigger a deploy and reports
+whether `server_shutdown` arrived — the only way to see, from the outside, that
+`SIGTERM` really reaches the Node process on the platform (§14).
+
+### What this suite deliberately does not prove
+
+True concurrency (PGlite is single-connection; the `scripts/*-test.mjs`
+concurrency scripts cover that against a real Postgres), multiple server
+instances (§12), a real browser (the client logic is unit-tested; the DOM is
+not), and the production-scale heartbeat (25s + 20s) — the logic is identical
+at a compressed clock, which is the point of making the values configurable.
 
 ## 14. Graceful Shutdown
 
@@ -829,10 +970,18 @@ start`, so Phase 16's live smoke test should confirm it by finding
   reimplementing send/membership/pagination logic — a duplicate
   `send_message` from an offline-queue replay is safe for the exact same
   database-level reason a duplicate HTTP POST was safe in v1.
-- Catch-up is ordered *before* the live room join specifically to avoid
-  a race at the seam between "history" and "live" — this is the kind of
-  boundary condition that only shows up under real reconnect testing,
-  never in a happy-path demo.
+- Phase 16's test suite found a real bug in Phase 12's catch-up, and fixing it
+  reversed a documented design decision. The original code ran the catch-up
+  query *before* joining the live room "so nothing is delivered twice"; a
+  deterministic test of the gap between the query and the join showed that a
+  message landing there is delivered *zero* times — silent data loss that
+  nothing repairs. Duplicates are invisible (clients dedupe); gaps are not, so
+  the server now joins first (§7). The follow-on bug — a client cursor that
+  treated "newest seen" as "everything below is known" and could skip a page
+  when a live push interleaved with a multi-page catch-up — was found by the
+  same suite and fixed by extracting `CatchUpCursor`. The lesson worth
+  carrying: the comment justifying the old order was *confidently* wrong, and
+  only an adversarial test of the boundary, not review, exposed it.
 - Presence uses reference counting with a grace period, not a boolean —
   handles multi-tab and avoids refresh-flicker, both real user behavior
   a naive implementation would get wrong on day one.

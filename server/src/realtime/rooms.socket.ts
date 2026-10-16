@@ -82,19 +82,36 @@ export function registerRoomHandlers(_io: Server, socket: Socket): void {
     try {
       await checkRoomMembership(roomId, userId);
 
-      // See ARCHITECTURE_V2.md §7: the catch-up query runs and is emitted
-      // to THIS socket BEFORE socket.join, deliberately. If join happened
-      // first, a message sent by someone else in the microseconds between
-      // "membership confirmed" and "catch-up query executes" could land in
-      // BOTH the catch-up batch (the DB already has it) AND arrive again
-      // as a live 'new_message' (this socket is now in the room). Running
-      // the query first, then joining, means the catch-up query's own
-      // snapshot is the only source for anything up to that point, and
-      // 'new_message' is the only source for anything after — no seam
-      // where a message could appear twice or not at all. A duplicate
-      // wouldn't even be visibly wrong client-side (mergeMessages dedupes
-      // by client_message_id), but "correct by construction" beats
-      // "happens to be masked by an unrelated dedupe."
+      // See ARCHITECTURE_V2.md §7. The socket joins the live room FIRST, and
+      // only then runs the catch-up query. Phase 12 did it the other way
+      // round ("query, then join, so nothing is delivered twice") and
+      // Phase 16's seam test proved that ordering is wrong:
+      //
+      //   query-then-join:  a message committed AFTER the query's snapshot
+      //   but BEFORE the join lands in neither place — it is not in the
+      //   batch (too late for the snapshot) and not pushed live (this
+      //   socket is not in the room yet). The client never learns it
+      //   exists, and nothing ever tells it to look.
+      //
+      //   join-then-query: that same message is pushed live (we are in the
+      //   room) and/or included in the batch (the query runs after the
+      //   join, so it sees everything the live path could miss). Worst
+      //   case it arrives TWICE — which the client already absorbs, since
+      //   mergeMessages dedupes by client_message_id.
+      //
+      // The two failure modes are not symmetric: a duplicate is invisible,
+      // a gap is silent data loss. Choose the duplicate. The consequence is
+      // that live new_message events can now arrive BEFORE the catch_up
+      // batch, so the client must not treat "the newest thing I've seen" as
+      // "everything up to here is known" — see client/src/realtime/catchUpCursor.ts.
+      //
+      // Safe to call even if this socket already joined this room earlier
+      // in the same connection (Socket.IO's room bookkeeping is a Set under
+      // the hood): that is what lets a follow-up page request reuse this
+      // exact event — the client re-emits join_room with the previous
+      // page's end as sinceSequence, and re-joining is a harmless no-op.
+      await socket.join(roomKey(roomId));
+
       if (sinceSequence !== undefined) {
         const { messages, hasMore } = await listMessagesAfter(roomId, sinceSequence, DEFAULT_PAGE_LIMIT);
         const latestSequenceNumber =
@@ -102,13 +119,6 @@ export function registerRoomHandlers(_io: Server, socket: Socket): void {
         socket.emit('catch_up', { roomId, messages, hasMore, latestSequenceNumber });
       }
 
-      // Safe to call even if this socket already joined this room earlier
-      // in the same connection (Socket.IO's own room-join bookkeeping is a
-      // Set under the hood) — this is what lets a follow-up page request
-      // for a large gap reuse this exact same event instead of needing a
-      // second one: the client just re-emits join_room with an updated
-      // sinceSequence, and re-joining is a harmless no-op.
-      await socket.join(roomKey(roomId));
       socket.emit('joined_room', { roomId });
       logger.info('socket joined room', { userId, roomId, socketId: socket.id, sinceSequence });
     } catch (err) {

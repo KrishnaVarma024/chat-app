@@ -15,7 +15,7 @@ types.setTypeParser(20, (value: string) => parseInt(value, 10));
 
 export const pool = new Pool({
   connectionString: env.databaseUrl,
-  max: 10,
+  max: env.dbPoolMax,
   idleTimeoutMillis: 30_000,
 });
 

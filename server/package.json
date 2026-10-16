@@ -33,7 +33,8 @@
     "test:reauth": "node --import tsx scripts/reauth-test.mjs",
     "test:shutdown": "node --import tsx scripts/shutdown-test.mjs",
     "test:reauth-transient": "node --import tsx scripts/reauth-transient-test.mjs",
-    "test:signals": "bash scripts/signal-forwarding-test.sh"
+    "test:signals": "bash scripts/signal-forwarding-test.sh",
+    "smoke:live": "node scripts/smoke-live.mjs"
   },
   "dependencies": {
     "bcrypt": "^6.0.0",
