@@ -23,35 +23,75 @@ export class ApiError extends Error {
 // brand-new token microseconds after it was issued. Deduping here means
 // normal UI usage essentially never fires that race in the first place —
 // a page with N simultaneous requests triggers at most ONE refresh, not N.
-let refreshPromise: Promise<boolean> | null = null;
+let refreshPromise: Promise<RefreshOutcome> | null = null;
 
-async function refreshAccessToken(): Promise<boolean> {
+/**
+ * What a refresh attempt tells the caller. A boolean can't carry the
+ * distinction that matters most to a long-lived socket:
+ *   ok        — new access token stored.
+ *   dead      — the server said 401/403: the refresh cookie is missing,
+ *               expired, revoked or reused. The session is over.
+ *   transient — a 5xx, a 429, or no response at all. NOTHING is known to be
+ *               wrong with the session, and the access token in memory is
+ *               still good until its own `exp`, so it is left in place and
+ *               the caller may try again.
+ * The old boolean conflated the last two and cleared the token on both.
+ */
+export type RefreshOutcome = 'ok' | 'dead' | 'transient';
+
+const REFRESH_LOCK_NAME = 'chat-app-refresh';
+
+/**
+ * The refresh token ROTATES (Phase 2), and every tab shares one cookie jar
+ * but has its own JS memory — so the in-tab single-flight above does nothing
+ * for two TABS refreshing at the same instant: both send the same cookie, the
+ * second looks like token reuse, and the server revokes the whole family
+ * (everyone gets logged out). The Web Locks API gives mutual exclusion across
+ * every tab of an origin: while one tab holds the lock the others queue, and
+ * by the time they run, the cookie jar already holds the rotated token.
+ * Browsers without it (very old ones, and jsdom) just run unlocked, which is
+ * exactly the previous behavior.
+ */
+async function withCrossTabLock<T>(fn: () => Promise<T>): Promise<T> {
+  const locks = typeof navigator !== 'undefined' ? navigator.locks : undefined;
+  return locks ? locks.request(REFRESH_LOCK_NAME, fn) : fn();
+}
+
+async function refreshAccessTokenOutcome(): Promise<RefreshOutcome> {
   if (refreshPromise) return refreshPromise;
 
-  refreshPromise = (async () => {
+  refreshPromise = withCrossTabLock(async (): Promise<RefreshOutcome> => {
     try {
       const res = await fetch(`${API_BASE}/auth/refresh`, {
         method: 'POST',
         credentials: 'include', // sends the httpOnly refresh_token cookie
       });
-      if (!res.ok) {
-        setAccessToken(null);
-        return false;
+      if (res.ok) {
+        const data: { accessToken: string } = await res.json();
+        setAccessToken(data.accessToken);
+        return 'ok';
       }
-      const data: { accessToken: string } = await res.json();
-      setAccessToken(data.accessToken);
-      return true;
+      if (res.status === 401 || res.status === 403) {
+        setAccessToken(null);
+        return 'dead';
+      }
+      return 'transient';
     } catch {
-      setAccessToken(null);
-      return false;
-    } finally {
-      // Cleared unconditionally so the *next* 401 — a genuinely new event
-      // that didn't race with this one — gets to trigger its own refresh.
-      refreshPromise = null;
+      return 'transient';
     }
-  })();
+  }).finally(() => {
+    // Cleared unconditionally so the *next* 401 — a genuinely new event
+    // that didn't race with this one — gets to trigger its own refresh.
+    refreshPromise = null;
+  });
 
   return refreshPromise;
+}
+
+/** Boolean view of the above, for callers that only need "do I have a fresh
+ * token now?" (apiFetch's retry, app boot). */
+async function refreshAccessToken(): Promise<boolean> {
+  return (await refreshAccessTokenOutcome()) === 'ok';
 }
 
 interface RequestOptions extends RequestInit {
@@ -103,4 +143,4 @@ export async function apiFetch<T>(path: string, options: RequestOptions = {}): P
 // Exposed so the app-boot flow (AuthContext) can attempt a silent refresh
 // directly, without a prior failed request to retry — there's nothing to
 // retry on first load, just a cookie to try exchanging for a fresh token.
-export { refreshAccessToken };
+export { refreshAccessToken, refreshAccessTokenOutcome };

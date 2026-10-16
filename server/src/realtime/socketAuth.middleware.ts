@@ -3,6 +3,17 @@ import { verifyAccessToken } from '../auth/tokens';
 
 export interface AuthedSocketData {
   userId: number;
+  // When the access token this socket authenticated with stops being valid
+  // (epoch ms, from the JWT's own `exp`). Set at the handshake and moved
+  // forward by every successful `reauth` (realtime/reauth.socket.ts, Phase
+  // 15 — ARCHITECTURE_V2.md §4). A socket is a long-lived thing riding on a
+  // short-lived credential; this is what keeps the two honest with each
+  // other.
+  tokenExpiresAtMs: number;
+  // Per-event "when may I send this socket ANOTHER rate_limited notice"
+  // bookkeeping — see realtime/socketRateLimit.ts for why notices are
+  // themselves throttled.
+  rateLimitNoticeUntil?: Record<string, number>;
   // NOT set by this middleware — kicked off once, right after 'connection'
   // fires, by a single findUserById lookup in realtime/socket.ts (kept out
   // of the handshake token itself so this middleware still mirrors
@@ -53,7 +64,9 @@ export function socketAuthMiddleware(socket: Socket, next: (err?: Error) => void
 
   try {
     const payload = verifyAccessToken(token);
-    (socket.data as AuthedSocketData).userId = payload.sub;
+    const data = socket.data as AuthedSocketData;
+    data.userId = payload.sub;
+    data.tokenExpiresAtMs = payload.exp * 1000;
     next();
   } catch {
     next(new Error('UNAUTHORIZED'));

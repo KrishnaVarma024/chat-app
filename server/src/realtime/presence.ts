@@ -29,6 +29,18 @@ const socketsByUser = new Map<number, Set<string>>();
  */
 const pendingOfflineTimers = new Map<number, NodeJS.Timeout>();
 
+/**
+ * Set once, by suspendPresence(), when the process starts shutting down
+ * (ARCHITECTURE_V2.md §14). Presence is a statement about who is connected
+ * to THIS process; during a shutdown every connection is about to drop at
+ * the same instant and — for a rolling deploy — reappear on the next
+ * instance moments later. Broadcasting an 'offline' for each of them (after
+ * the grace period, from a process that is already tearing down its DB
+ * pool) would be both wrong and noisy: exactly the refresh-flicker the grace
+ * period exists to prevent, multiplied by every user at once.
+ */
+let suspended = false;
+
 async function broadcastPresence(io: Server, userId: number, status: 'online' | 'offline'): Promise<void> {
   // "Every room that user is a member of" per §9 — DB membership, not
   // Socket.IO room membership. io.to(roomKey(id)) only actually reaches
@@ -51,6 +63,7 @@ async function broadcastPresence(io: Server, userId: number, status: 'online' | 
  * deliberately broadcasts nothing at all, not even a fresh 'online').
  */
 export async function markOnline(io: Server, userId: number, socketId: string): Promise<void> {
+  if (suspended) return;
   const pendingTimer = pendingOfflineTimers.get(userId);
   if (pendingTimer) {
     clearTimeout(pendingTimer);
@@ -93,6 +106,7 @@ export async function markOnline(io: Server, userId: number, socketId: string): 
  * every page refresh to everyone in the user's rooms.
  */
 export function markOffline(io: Server, userId: number, socketId: string): void {
+  if (suspended) return;
   const sockets = socketsByUser.get(userId);
   if (!sockets) return; // already cleaned up somehow — nothing to do
   sockets.delete(socketId);
@@ -118,6 +132,19 @@ export function markOffline(io: Server, userId: number, socketId: string): void 
   }, env.presenceGracePeriodMs);
 
   pendingOfflineTimers.set(userId, timer);
+}
+
+/**
+ * Stops presence from broadcasting anything further and cancels every
+ * pending grace-period timer. Called once, at the start of graceful
+ * shutdown, BEFORE connections are closed — so the wave of 'disconnect'
+ * events that closing them triggers finds presence already quiet. One-way
+ * on purpose: a process that has begun shutting down is never going back.
+ */
+export function suspendPresence(): void {
+  suspended = true;
+  for (const timer of pendingOfflineTimers.values()) clearTimeout(timer);
+  pendingOfflineTimers.clear();
 }
 
 /** Small introspection utility — not currently called from any request path

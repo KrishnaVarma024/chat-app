@@ -19,7 +19,8 @@ import {
   DEFAULT_PAGE_LIMIT,
 } from '../db/messages.repo';
 import { ValidationError, NotFoundError } from '../errors';
-import { createRateLimiter } from '../rateLimit/rateLimit.middleware';
+import { createRateLimitMiddleware } from '../rateLimit/rateLimit.middleware';
+import { sendMessageStore, pollMessagesStore } from '../rateLimit/limits';
 import { sendMessageSchema } from './messages.validation';
 
 export const roomsRouter = Router();
@@ -31,21 +32,13 @@ roomsRouter.use(requireAuth);
 // Two separate limiters, not one shared budget: a client legitimately
 // polling every few seconds (possibly from more than one open tab) would
 // otherwise eat into the same budget as sending messages, throttling a
-// user who's just reading, not spamming. Numbers are sized against the
-// client's own polling behavior (usePolling.ts: base 3s, backs off to a
-// 15s cap, and Page Visibility pausing means an idle/backgrounded tab
-// sends nothing at all) with headroom for a couple of simultaneously open
-// tabs, while still being low enough to stop a scripted flood.
-const sendMessageLimiter = createRateLimiter({
-  keyPrefix: 'send',
-  capacity: 10, // burst: 10 messages fired back-to-back
-  refillPerSecond: 2, // sustained: 2/sec thereafter
-});
-const pollMessagesLimiter = createRateLimiter({
-  keyPrefix: 'poll',
-  capacity: 20, // burst: covers a few tabs all polling/scrolling back at once
-  refillPerSecond: 5, // sustained: 5/sec — well above what legitimate polling needs
-});
+// user who's just reading, not spamming. The numbers live in
+// rateLimit/limits.ts (sized against usePolling.ts's behavior, with
+// headroom for a couple of open tabs) — and the SEND store is the same
+// one the socket `send_message` handler spends from (Phase 15), so
+// alternating between the two transports gains an attacker nothing.
+const sendMessageLimiter = createRateLimitMiddleware(sendMessageStore);
+const pollMessagesLimiter = createRateLimitMiddleware(pollMessagesStore);
 
 const createRoomSchema = z.object({
   name: z.string().min(1).max(100),

@@ -6,6 +6,8 @@ import { ValidationError } from '../errors';
 import { logger } from '../observability/logger';
 import { roomKey, emitError } from './rooms.socket';
 import type { AuthedSocketData } from './socketAuth.middleware';
+import { enforceSocketRateLimit } from './socketRateLimit';
+import { sendMessageStore } from '../rateLimit/limits';
 
 /**
  * Registers this socket's message-related event handlers. Called once per
@@ -17,6 +19,18 @@ export function registerMessageHandlers(_io: Server, socket: Socket): void {
   const { userId } = socket.data as AuthedSocketData;
 
   socket.on('send_message', async (payload: { roomId?: number; body?: string; clientMessageId?: string }) => {
+    // First thing, before validation and before any DB work (Phase 15 —
+    // ARCHITECTURE_V2.md §11): a refused event should cost almost nothing,
+    // and charging a token before validating means garbage payloads can't
+    // be used as a free flood either. Spends from the SAME store the HTTP
+    // POST route does (rateLimit/limits.ts) — one send budget per user, no
+    // matter which transport they use. A refusal emits `rate_limited` to
+    // this socket and nothing else: no disconnect, and no per-message
+    // error, because the message isn't definitively rejected — it stays in
+    // the client's outbox and is retried after the advertised delay (safe,
+    // since sends are idempotent — Phase 4).
+    if (!enforceSocketRateLimit(socket, sendMessageStore, 'send_message')) return;
+
     const roomId = Number(payload?.roomId);
     if (!Number.isInteger(roomId) || roomId <= 0) {
       return emitError(socket, new ValidationError('Invalid room id'), { clientMessageId: payload?.clientMessageId });

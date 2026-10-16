@@ -129,6 +129,72 @@ and a needless gap in delivery:
    knows to refresh *before* attempting to reconnect, rather than
    retrying with a token that will just be rejected again.
 
+**Implementation note (Phase 15):** the five steps above shipped as
+`realtime/reauth.socket.ts` (server) and `client/src/realtime/connectionLifecycle.ts`
+(client). What building them added:
+
+- **`exp` comes from the token, not from a config constant.** The
+  handshake middleware records `payload.exp * 1000` on `socket.data`, and
+  `verifyAccessToken` now returns it (rejecting any token without a numeric
+  `exp`). The warning fires at `exp - min(TOKEN_EXPIRY_WARNING_LEAD_MS,
+  remaining / 2)` — the midpoint floor exists because a token shorter than
+  the lead would otherwise be "already expiring" the moment it's issued, and
+  the client would refresh in a loop.
+- **`reauth` is acked** with `{ ok, expiresInMs }` or `{ ok: false, code }`.
+  A bad or expired token answers `UNAUTHORIZED` and leaves the socket (and
+  its timers) alone — a garbage reauth must not become a way to kick
+  yourself. A *valid token for a different user* answers `FORBIDDEN` and
+  closes the socket: without that check, `reauth` is an identity-swap
+  primitive, because everything downstream trusts `socket.data.userId`.
+- **No database in this path.** The refresh endpoint is already the gate on
+  "does this session still exist," so a revoked session can ride its current
+  access token to its natural expiry and no further — revocation latency is
+  bounded by one access-token TTL, the same bound every HTTP request already
+  lives with.
+- **The client needs three recovery paths, not one**, because Socket.IO
+  does *not* auto-retry a server-initiated disconnect (`io server
+  disconnect`) or a middleware rejection (`connect_error`): (1)
+  `token_expiring` → refresh → `reauth` in place (the happy path); (2)
+  `disconnect_reason: token_expired` + `io server disconnect` → refresh,
+  *then* `socket.connect()`; (3) `connect_error: UNAUTHORIZED` (e.g. a laptop
+  woke up past its token's lifetime) → refresh → `socket.connect()`,
+  capped at 3 consecutive tries so a refresh that "works" but yields a
+  still-rejected token cannot loop. If the in-place swap itself fails, the
+  client falls back to a clean disconnect/connect; Phase 12's catch-up
+  covers the gap.
+- **Cross-tab race (closed in the Phase 15 exercises).** The refresh token
+  rotates, so two tabs refreshing at the same instant look like reuse and
+  revoke the whole family. In-tab single-flight (v1) doesn't help across
+  tabs. A 0–1.5s random delay before refreshing made a collision unlikely;
+  `api/client.ts` now also wraps the refresh in a Web Lock
+  (`navigator.locks`), so the second tab's request only leaves after the
+  first has rotated the cookie. `crossTabRefresh.test.ts` runs the real
+  module as two tabs against a rotating-token fake server: without the lock
+  the loser is told `dead` and the family is revoked; with it both succeed.
+
+`scripts/reauth-test.mjs` runs the *real* client module against a server
+started with `ACCESS_TOKEN_TTL=6s TOKEN_EXPIRY_WARNING_LEAD_MS=3000`:
+two clients stay connected ~17s (nearly three token lifetimes) with the
+same socket ids, zero disconnects, six reauth round trips, and 26 of 26
+messages delivered live with contiguous sequence numbers that equal what
+the database holds. A control client that ignores `token_expiring` is
+warned ~2.5s before `exp` and force-disconnected at `exp` — the proof that
+the first result is the reauth working, not expiry being unenforced. It also
+covers the identity swap, the garbage token, and the expired-token
+handshake. (Writing it surfaced one gap, since closed: `refreshAccessToken` returned
+`false` for *any* non-2xx, so a transient 5xx on refresh was treated like a
+dead session — and cleared a perfectly good access token. It now returns
+`ok` / `dead` / `transient`; only 401/403 is `dead`, and a `transient`
+failure is retried with jittered exponential backoff for as long as the
+token has time left — the `token_expiring` payload's `expiresInMs` is the
+retry budget, not a fixed count. `reauth-transient-test.mjs` injects one
+failure: the three-way client keeps the same socket, the boolean control is
+force-closed at expiry and has to reconnect.) A `FORBIDDEN` reauth ack —
+another tab signed in as a different user and the shared cookie now mints
+*their* tokens — is reported through `onIdentityChanged` and deliberately
+**not** reconnected: reopening the socket would silently continue as the
+other user under the first user's UI.
+
 **Joining a room.** `join_room: { roomId }` → server runs the *same*
 membership check v1's `requireRoomMembership` does (refactored into a
 plain function called from both the Express middleware and this socket
@@ -515,6 +581,66 @@ a transient burst is far more disruptive than rejecting one HTTP request
 was in v1, since it now costs a full reconnect-and-catch-up cycle to
 recover instead of just the next request succeeding.
 
+**Implementation note (Phase 15):** the sketch above is the shape; four
+things changed building it.
+
+- **One store per limited thing, shared across transports.** The v1
+  limiter owned its own buckets inside Express middleware, so a socket
+  handler could not spend from them. `rateLimit/bucketStore.ts` now owns
+  the buckets (`consume(userId)` → allowed, or refused with
+  `retryAfterSeconds`), `rateLimit/limits.ts` declares `sendMessageStore`,
+  `pollMessagesStore` and `typingStore` as process-wide singletons, and
+  both the HTTP route and the socket handler spend from the same
+  `sendMessageStore`. Separate budgets per transport would hand a client
+  double the rate by alternating between them. Full buckets are swept
+  opportunistically inside `consume()` — no timer to leak, nothing to
+  unref. (Precisely: the sweep runs inside `consume()`, so memory is bounded
+  by users active within the last sweep interval — but if traffic stops
+  entirely nothing runs, and the map keeps its last size until the next
+  request from anyone. Bounded, not zero; proved in `rateLimit.exercises.test.ts`.)
+- **The limiter runs first in the handler**, before validation and the
+  membership check (`socketRateLimit.ts`). A refused event should cost
+  almost nothing, and if invalid payloads got an `error` reply for free, a
+  flood of garbage would turn the server into an amplifier.
+- **The notices are themselves throttled.** Answering a 1,000-events/sec
+  flood with 1,000 `rate_limited` events would make the limiter amplify the
+  very flood it exists to stop. Each (socket, event) pair gets at most one
+  notice per `retryAfterSeconds`, which is also how long the client was told
+  to wait, so a well-behaved client never needs a second. The same throttle
+  bounds the `warn` log line. This supersedes Phase 14's silent drop for
+  typing — silence protected against the same amplification, but the
+  roadmap's contract is "an event to that socket," and throttling the
+  notice delivers both. `typing_start` and `typing_stop` share one bucket
+  (otherwise alternating between them doubles the rate) but track notices
+  separately.
+- **A refused `send_message` is not a failed one.** The notice describes
+  the socket's *budget*, not any single message's fate, so it carries no
+  `clientMessageId`. The message stays in the client's outbox; the client
+  schedules one flush at `retryAfterSeconds` + 100ms. That is safe because
+  sends are idempotent (Phase 4) — a retry that lands twice still creates one
+  row. Typing notices are ignored client-side; a dropped indicator is not
+  worth retrying. The chat page shows "You're sending messages too quickly.
+  Retrying automatically in Ns…".
+
+Keyed by `userId`, never `socket.id` — a per-connection budget gives every
+extra tab its own free allowance. `scripts/ratelimit-test.mjs` floods 200
+`send_message` and 200 `typing_start` events from one user while a second
+user in the same room keeps working: one `rate_limited` notice per flood,
+the flooder's socket keeps the *same* socket id (a silent reconnect would
+change it), 10–11 of 200 sends persisted, about a dozen replies in total (acks included),
+the other user's five sends all acked and delivered, ~10 typing events
+relayed, and the flooder can send again after the window. (The existing
+`catchup-test.mjs` broke on first run — it sends 55 messages back-to-back
+from one socket — and was changed to behave like the real outbox: wait the
+advertised delay, resend the same `clientMessageId`.) The limiter's
+behavior is also pinned deterministically, with fake timers, in
+`bucketStore.test.ts` and `socketRateLimit.test.ts`.
+
+*Still single-process:* the buckets live in this process's memory, so with
+N instances a user's real limit is N× the configured one. Deferred along
+with the rest of horizontal scaling (§12); a Redis-backed store is the
+swap, and `BucketStore` is the seam.
+
 ## 12. Explicitly Deferred (and why)
 
 - **Horizontal scaling (multiple server instances).** Presence and room
@@ -595,6 +721,94 @@ The client treats `server_shutdown` as a signal to reconnect
 immediately rather than respecting its current backoff delay — this is
 a planned, expected disconnect, not a failure, and should recover as
 fast as a fresh connection allows.
+
+**Implementation note (Phase 15):** the sketch above has two bugs that
+only show up when you try to prove the DoD for real, and one thing it left
+out.
+
+- **`io.emit("server_shutdown")` followed by `io.close()` is a race.**
+  `emit` queues the packet; `close` can tear the transport down before it
+  is flushed, and the client sees an ordinary dropped connection — exactly
+  what the notice was meant to prevent. `lifecycle/shutdown.ts` instead
+  uses a broadcast *with acknowledgements*
+  (`io.timeout(ms).emit("server_shutdown", cb)`, Socket.IO ≥ 4.5): the
+  callback fires when every client has acked or the timeout (default 3s,
+  `SHUTDOWN_ACK_TIMEOUT_MS`) elapses, whichever is first, and with zero
+  clients it fires immediately. "Everyone has heard, or 3s passed" is
+  deterministic; a guessed `sleep(200)` is not.
+- **`process.exit(0)` after an unbounded `await` is a hostage situation.**
+  The handler arms an unref'd hard timer (`SHUTDOWN_HARD_TIMEOUT_MS`, default
+  10s — comfortably under Render's 30s SIGKILL deadline, so *this process*
+  chooses when it dies, not the platform) that exits 1. It is idempotent (a
+  second SIGTERM while draining is a no-op), and any error in the sequence
+  exits 1 rather than hanging.
+- **Presence has to be told to stand down.** Closing every socket would run
+  every disconnect handler, and each would schedule an "offline" broadcast
+  for a user who is merely mid-deploy. `suspendPresence()` cancels pending
+  grace timers and turns `markOnline`/`markOffline` into no-ops first. `/health`
+  also flips to `503 { shuttingDown: true }` so a load balancer stops routing
+  here.
+
+Order: mark shutting down + suspend presence → broadcast `server_shutdown`
+and wait for acks → `io.close()` (which also closes the HTTP listener) →
+`pool.end()` → `exit(0)`. `SIGINT` takes the same path for local Ctrl-C.
+
+**Client:** on `server_shutdown` the lifecycle module acks and remembers it
+for 30s. The next disconnect then gets a **zero first-retry delay** —
+Socket.IO's backoff is `delay × 2^attempts`, so `reconnectionDelay(0)` left
+in place would be a hot loop against a port nobody is listening on yet; it
+is therefore restored the instant that first attempt starts
+(`reconnect_attempt`), after which ordinary exponential backoff with jitter
+resumes. This only works because the Manager emits `close` (which produces
+the socket's `disconnect`) *before* it computes the reconnect delay;
+`scripts/shutdown-test.mjs` measures that rather than trusting a reading of
+the library. If the server instead closes with `io server disconnect`
+(which Socket.IO never auto-retries), the client calls `connect()` itself.
+
+`scripts/shutdown-test.mjs` spawns the real server, SIGTERMs its pid, and
+measures: both clients got and acked the notice (server log: `acked: 2`,
+`timedOut: false`) 5ms after the signal, *before* the drop; the first
+reconnect attempt came 1–2ms after the disconnect and went out immediately
+(connection refused — nothing was listening yet); the process exited 0 in
+~320ms. A replacement server on the same port is reconnected to without
+help, and `join_room` works on the new connection. **Control:** SIGKILLing
+that replacement — no notice possible — makes the *same* clients wait out
+ordinary backoff (581ms and 1278ms before the first attempt in one run — 1s ± 50% jitter), which is what
+makes the 1–2ms number meaningful.
+
+*Known gap:* a connection accepted during the ≤3s drain window is not in
+the broadcast's recipient set, so it misses the notice and pays one normal
+backoff. The window is small and the failure mode is just "slower, not
+broken"; closing it means refusing new handshakes once shutdown begins.
+
+**On Render specifically** (<https://render.com/docs/deploys>): a deploy
+starts the new instance, moves all traffic to it, and only *60 seconds
+later* sends `SIGTERM` to the old one, which then has a shutdown delay
+(default 30s, configurable to 300s) before `SIGKILL`. So by the time the
+notice goes out, the replacement is already live and an immediate reconnect
+lands on a healthy server — the best case for the zero-first-delay retry —
+and the "connection accepted during the drain" gap above is close to moot,
+because new connections stopped arriving a minute ago.
+
+**Production issue found by experiment, and its one-word fix (Phase 15
+exercise T1):** `render.yaml` starts the service with `npm run start`, and
+`start` was `npm run migrate:up:prod && node dist/index.js`. That makes `npm`
+and then an `sh -c` (for the `&&`) the processes Render signals, and neither
+forwards `SIGTERM` past its own direct child — so the Node handler above
+would never have run and Render would have fallen back to `SIGKILL` after
+the shutdown delay. Everything in this section had been verified by
+launching `node` directly, which is not how it is launched in production.
+`scripts/signal-forwarding-test.sh` starts the real server five ways and
+SIGTERMs whatever it launched: `npm run` of `a && node …` and `sh -c 'a &&
+node …'` leave the server running with the handler never fired; `sh -c 'a &&
+exec node …'`, `npm run` of `a && exec node …`, and plain `node …` all run
+it and stop cleanly. So the fix is `exec` in the `start` script (`exec`
+replaces the shell with node, making node npm's direct child, which npm does
+forward to), no change to `render.yaml`. Moving migrations to Render's
+`preDeployCommand` would also work but is not available on the free plan.
+Not verifiable from here: any wrapper Render itself puts around `npm run
+start`, so Phase 16's live smoke test should confirm it by finding
+`shutdown initiated` in the *old* instance's logs after a deploy.
 
 ## 15. What a Reviewer Should Notice
 

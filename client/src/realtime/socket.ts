@@ -1,7 +1,8 @@
 import { io, type Socket } from 'socket.io-client';
-import { API_BASE } from '../api/client';
+import { API_BASE, refreshAccessToken, refreshAccessTokenOutcome } from '../api/client';
 import { getAccessToken } from '../api/tokenStore';
 import { enqueueMessage, flushQueueOverSocket, removeFromQueue } from './outbox';
+import { attachConnectionLifecycle } from './connectionLifecycle';
 
 // Module-level singleton, same reasoning as tokenStore.ts: there is exactly
 // ONE socket connection for the whole app (not one per component that
@@ -9,6 +10,7 @@ import { enqueueMessage, flushQueueOverSocket, removeFromQueue } from './outbox'
 // creating their own. Phase 10 wires this into the chat view; Phase 9 only
 // needs connect/join/leave to exist and be verifiable.
 let socket: Socket | null = null;
+let detachLifecycle: (() => void) | null = null;
 
 export function connectSocket(): Socket {
   if (socket) return socket;
@@ -53,6 +55,23 @@ export function connectSocket(): Socket {
     if (payload?.clientMessageId) removeFromQueue(payload.clientMessageId);
   });
 
+  // Phase 15 — credential expiry, planned server restarts, stale-token
+  // reconnects and rate-limit retries. Attached once, at creation, for the
+  // same reason as the outbox listeners above: these are properties of the
+  // CONNECTION, not of whichever room UI happens to be mounted.
+  detachLifecycle = attachConnectionLifecycle(socket, {
+    refreshAccessToken,
+    refreshAccessTokenDetailed: refreshAccessTokenOutcome,
+    // Another tab signed in as a different user and the shared refresh cookie
+    // now mints THEIR tokens. Reloading re-bootstraps auth from the cookie, so
+    // the whole UI (not just the socket) agrees on who is signed in.
+    onIdentityChanged: () => window.location.reload(),
+    getAccessToken,
+    flushOutbox: () => {
+      if (socket) flushQueueOverSocket(socket);
+    },
+  });
+
   return socket;
 }
 
@@ -61,6 +80,8 @@ export function getSocket(): Socket | null {
 }
 
 export function disconnectSocket(): void {
+  detachLifecycle?.();
+  detachLifecycle = null;
   socket?.close();
   socket = null;
 }
