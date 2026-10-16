@@ -84,4 +84,44 @@ describe('CatchUpCursor', () => {
     c.onCatchUp(batch(80, false, 1));
     expect(c.value).toBe(100);
   });
+
+  describe('contiguity watermark (live pushes can overtake each other)', () => {
+    it('a live push beyond a hole does not move the cursor; filling the hole releases everything waiting above it', () => {
+      const c = new CatchUpCursor(0);
+      c.onLive(2); // seq 2 overtook seq 1
+      expect(c.value).toBe(0);
+      expect(c.hasGap).toBe(true);
+      c.onLive(3);
+      expect(c.value).toBe(0);
+      c.onLive(1); // the late one arrives
+      expect(c.value).toBe(3);
+      expect(c.hasGap).toBe(false);
+    });
+
+    it('a disconnect while a hole is open reconnects from the WATERMARK, so the missing message is refetched', () => {
+      const c = new CatchUpCursor(0);
+      c.onLive(2);
+      c.onDisconnect();
+      expect(c.beginJoin()).toBe(0); // NOT 2
+    });
+
+    it('a catch_up page that spans the hole is authoritative: it jumps the watermark and absorbs what was waiting', () => {
+      const c = new CatchUpCursor(0);
+      c.beginJoin();
+      c.onLive(2);
+      expect(c.onCatchUp(batch(2, false, 2))).toBeNull();
+      expect(c.value).toBe(2);
+      expect(c.hasGap).toBe(false);
+    });
+
+    it('a burned sequence number leaves a permanent hole: the watermark holds, the next catch_up steps over it', () => {
+      const c = new CatchUpCursor(4);
+      c.onLive(6); // 5 was burned by a duplicate retry - it will never arrive
+      c.onLive(7);
+      expect(c.value).toBe(4); // conservative, never wrong
+      c.beginJoin();
+      c.onCatchUp(batch(7, false, 2)); // the server says: nothing between 4 and 6 exists
+      expect(c.value).toBe(7);
+    });
+  });
 });

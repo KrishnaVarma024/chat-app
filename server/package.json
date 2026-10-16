@@ -16,6 +16,7 @@
     "db:up": "docker compose up -d",
     "db:down": "docker compose down",
     "test": "vitest run",
+    "test:fast": "TEST_PARALLEL=1 vitest run",
     "test:watch": "vitest",
     "test:concurrency": "node scripts/concurrency-test.mjs",
     "test:scrollback-stability": "node scripts/scrollback-stability-test.mjs",

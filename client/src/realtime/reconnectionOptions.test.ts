@@ -78,6 +78,22 @@ describe('backoff schedule (jitter pinned to zero so the numbers are exact)', ()
     expect(attemptTimes[0]).toBe(1000); // measured from virtual t=0
   });
 
+  it('holds when open() reports back ASYNCHRONOUSLY, as a real network does: the next attempt is scheduled from a microtask', async () => {
+    // The other tests stub open() with a synchronous callback, so they would
+    // pass with either flavour of timer advance. This one is the guard for
+    // the async flavour: vi.advanceTimersByTime (sync) fires the first timer
+    // and returns without ever running the microtask that schedules the
+    // second, so it would record only [1000]. advanceTimersByTimeAsync runs
+    // pending microtasks between timers, which is what real time does.
+    const { internals, attemptTimes } = managerWith('forever', 0);
+    internals.open = (cb) => queueMicrotask(() => cb(new Error('connection refused')));
+    internals.reconnect();
+    await vi.advanceTimersByTimeAsync(1000 + 2000 + 4000 + 8000);
+
+    const gaps = attemptTimes.map((t, i) => t - (attemptTimes[i - 1] ?? 0));
+    expect(gaps).toEqual([1000, 2000, 4000, 8000]);
+  });
+
   it('never fires early: nothing at 999ms, the attempt at exactly 1000ms', async () => {
     const { internals, attemptTimes } = managerWith('forever', 0);
     internals.reconnect();

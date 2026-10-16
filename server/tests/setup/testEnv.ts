@@ -23,3 +23,13 @@ export const TEST_ENV = {
 } as const;
 
 export const TEST_DB_PORT = 5544;
+
+// Opt-in parallel test files (`npm run test:fast`). PGlite serves ONE connection at a time, so parallelism
+// cannot mean "many files, one database" (that is exactly the "Connection terminated unexpectedly" failure);
+// it means one independent database per worker slot, each on its own port, each migrated. The default
+// (serial) run uses a single database on TEST_DB_PORT, exactly as before.
+export const TEST_PARALLEL = process.env.TEST_PARALLEL === '1';
+export const TEST_DB_COUNT = TEST_PARALLEL ? Number(process.env.TEST_DB_COUNT ?? 4) : 1;
+/** The database URL for a vitest worker slot (VITEST_POOL_ID is 1-based). */
+export const dbUrlForWorker = (poolId: number) =>
+  `postgresql://postgres:postgres@127.0.0.1:${TEST_DB_PORT + ((poolId - 1) % TEST_DB_COUNT)}/postgres`;

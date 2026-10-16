@@ -14,11 +14,16 @@ import { EventEmitter } from 'node:events';
  * the live rooms, subscribes and evicts. Dependencies point inward: routes
  * -> this module <- sockets.
  *
- * Process-local on purpose, exactly like presence and room fan-out (see
- * ARCHITECTURE_V2.md §12): with more than one instance, this announcement
- * has to travel through the same shared layer (the Redis adapter) as
- * everything else, or the instance that served the HTTP request would be the
- * only one to evict.
+ * This is an EDGE: it fires once, in the process that served the HTTP
+ * request, and nothing repeats it. The eviction it triggers
+ * (`io.in(...).socketsLeave(...)`) is cluster-wide once a shared adapter such
+ * as Redis is installed, so the normal path survives scaling out. What does
+ * not survive is a LOST edge - an exception between the DELETE and the
+ * announce, or an instance dying in that window while another instance holds
+ * the user's socket. A single instance that dies takes its sockets with it
+ * (clients rejoin and join_room re-checks the database); with several, the
+ * survivors keep their cached "yes". realtime/membershipSweep.ts is the
+ * level-triggered backstop that bounds that staleness.
  */
 export interface MembershipRevoked {
   roomId: number;

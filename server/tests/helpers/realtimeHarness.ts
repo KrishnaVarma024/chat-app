@@ -40,6 +40,20 @@ export async function waitUntil(predicate: () => boolean, timeoutMs = 5000, labe
   }
 }
 
+/**
+ * A promise you resolve from the outside: the "gate" a test parks a handler
+ * behind so a race can be forced into one exact interleaving instead of being
+ * hoped for with sleeps. Typical use: wrap `server.repo.sendMessage` with
+ * `vi.spyOn(...).mockImplementationOnce`, let the real INSERT commit, then
+ * `await gate.promise` before returning - the handler is frozen between
+ * "committed" and "acked/broadcast" until the test says otherwise.
+ */
+export function deferred<T = void>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((r) => (resolve = r));
+  return { promise, resolve };
+}
+
 export interface RealtimeServer {
   /** e.g. http://127.0.0.1:51234 — pass to registerUser/createRoom (supertest accepts a URL) and to TestClient. */
   url: string;
@@ -391,6 +405,8 @@ export interface TestProxy {
   blackhole(): void;
   /** Hard-close every proxied connection WITHOUT telling anyone why (no server_shutdown notice) — a crash or a network cut. The listener keeps accepting. */
   cutAll(): void;
+  /** Wire bytes that actually crossed the proxy (WebSocket framing included), per direction. For asserting how much a server SAYS, not just what. */
+  readonly bytes: { clientToServer: number; serverToClient: number };
   close(): Promise<void>;
 }
 
@@ -412,6 +428,7 @@ export interface TestProxy {
 export async function startProxy(targetPort: number): Promise<TestProxy> {
   let dropping = false;
   let target = targetPort;
+  const bytes = { clientToServer: 0, serverToClient: 0 };
   const sockets = new Set<net.Socket>();
   const server = net.createServer((client) => {
     const upstream = net.connect(target, '127.0.0.1');
@@ -419,7 +436,9 @@ export async function startProxy(targetPort: number): Promise<TestProxy> {
     sockets.add(upstream);
     const pump = (from: net.Socket, to: net.Socket) => {
       from.on('data', (chunk) => {
-        if (!dropping) to.write(chunk);
+        if (dropping) return;
+        bytes[from === client ? 'clientToServer' : 'serverToClient'] += chunk.length;
+        to.write(chunk);
       });
       from.on('close', () => {
         sockets.delete(from);
@@ -435,6 +454,7 @@ export async function startProxy(targetPort: number): Promise<TestProxy> {
   return {
     port,
     url: `http://127.0.0.1:${port}`,
+    bytes,
     setTarget(p) {
       target = p;
     },
