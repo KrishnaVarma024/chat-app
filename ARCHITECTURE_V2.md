@@ -1049,7 +1049,8 @@ with a pool of one and loses 40 of 50 (`unique_violation`) with a pool of ten,
 and two transactions locking the same two rows in opposite order both commit
 with a pool of one but one dies with `deadlock detected` (`40P01`) with a pool
 of two. The `scripts/*-test.mjs` concurrency scripts cover those against a real
-Postgres. (A pool of one is *loud*, not blind, about the opposite bug: holding a
+Postgres, and `npm run demo:pool-size` reproduces all of the above as
+measurements. (A pool of one is *loud*, not blind, about the opposite bug: holding a
 checked-out client while awaiting a second `pool.query` — say, calling
 `checkRoomMembership` inside a transaction — deadlocks instantly with one
 connection, while a pool of ten hides it until ten requests are in flight at

@@ -96,6 +96,7 @@ npm run test:refresh-race           # concurrent refresh calls on the same token
 npm run test:register-race          # concurrent registration with the same email
 npm run test:leave-race             # concurrent /leave calls stay idempotent
 npm run test:hardening              # same hardening checks as `npm test`, against a live server
+npm run demo:pool-size              # what a pool of ONE hides (races, lock-order deadlocks) and what it exposes (nested pool.query), measured
 ```
 
 One command for correctness, a documented second one for what needs real
