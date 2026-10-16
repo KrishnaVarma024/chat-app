@@ -19,6 +19,7 @@
     "test:fast": "TEST_PARALLEL=1 vitest run",
     "test:watch": "vitest",
     "test:concurrency": "node scripts/concurrency-test.mjs",
+    "demo:pool-size": "node scripts/pool-size-demo.mjs",
     "test:scrollback-stability": "node scripts/scrollback-stability-test.mjs",
     "test:hardening": "node scripts/hardening-test.mjs",
     "test:refresh-race": "node scripts/refresh-race-test.mjs",
