@@ -17,6 +17,16 @@ export function roomKey(roomId: number): string {
 }
 
 /**
+ * A Socket.IO room containing every socket one USER has open (every tab,
+ * every device). Lets the server address a person rather than a connection —
+ * which is what "this user was removed from room 7" needs: evict all of their
+ * sockets from `room:7`, without having to enumerate them.
+ */
+export function userKey(userId: number): string {
+  return `user:${userId}`;
+}
+
+/**
  * Same error SHAPE the HTTP API already returns:
  * { error: { code, message } }. A client-side error handler that already
  * knows how to read an HTTP error body doesn't need a second, socket-
@@ -111,6 +121,22 @@ export function registerRoomHandlers(_io: Server, socket: Socket): void {
       // exact event — the client re-emits join_room with the previous
       // page's end as sinceSequence, and re-joining is a harmless no-op.
       await socket.join(roomKey(roomId));
+
+      // Check membership AGAIN, now that we are in the room. The check at the
+      // top and the join above are two separate steps with awaits between
+      // them; if the user's membership ended in that gap, the eviction in
+      // socket.ts (socketsLeave) ran before this socket was in the room and
+      // so could not remove it — leaving a zombie member who receives every
+      // push. Re-verifying after the join closes the window from both sides:
+      // either the leave's eviction finds this socket already in the room, or
+      // this check sees the membership row already gone. (Joins are rare, so
+      // the extra query is cheap insurance for an authorization boundary.)
+      try {
+        await checkRoomMembership(roomId, userId);
+      } catch (err) {
+        await socket.leave(roomKey(roomId));
+        throw err;
+      }
 
       if (sinceSequence !== undefined) {
         const { messages, hasMore } = await listMessagesAfter(roomId, sinceSequence, DEFAULT_PAGE_LIMIT);

@@ -187,8 +187,9 @@ It waits out the cold start, makes two throwaway accounts and a room, and
 verifies — through Render's real proxy — the polling → WebSocket **upgrade**,
 pushed delivery (with end-to-end latency), typing, presence online/offline
 (it waits out the real 7-second grace period), idempotent resend, a forced
-disconnect followed by an exact catch-up, and that a flood gets `rate_limited`
-without being disconnected. Exit code `0` and `ALL SMOKE CHECKS PASSED` mean
+disconnect followed by an exact catch-up, a user who leaves a room being
+cut off immediately, and that a flood gets `rate_limited` without being
+disconnected. Exit code `0` and `ALL SMOKE CHECKS PASSED` mean
 real-time works in production. If the upgrade line fails, the proxy isn't
 passing WebSockets through and the rest of the output is for a degraded mode.
 

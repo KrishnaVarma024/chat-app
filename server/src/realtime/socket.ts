@@ -2,7 +2,8 @@ import type { Server as HttpServer } from 'http';
 import { Server } from 'socket.io';
 import { env } from '../config/env';
 import { socketAuthMiddleware, type AuthedSocketData } from './socketAuth.middleware';
-import { registerRoomHandlers } from './rooms.socket';
+import { registerRoomHandlers, roomKey, userKey } from './rooms.socket';
+import { onMembershipRevoked } from './membershipEvents';
 import { registerMessageHandlers } from './messages.socket';
 import { registerTypingHandlers } from './typing.socket';
 import { registerReauthHandlers } from './reauth.socket';
@@ -34,6 +35,18 @@ export function attachSocketServer(httpServer: HttpServer): Server {
   // Runs BEFORE 'connection' fires — an unauthenticated handshake never
   // reaches the handler below at all.
   io.use(socketAuthMiddleware);
+
+  // Membership is checked when a socket JOINS a room (join_room), which makes
+  // every later push a cached "yes". When an HTTP route ends a membership,
+  // evict that user's sockets from the live room right away and tell them
+  // why — otherwise a user who left (or was removed) keeps receiving the
+  // room's messages, typing and presence until they happen to reconnect.
+  // v1's polling re-checked on every request and never had this problem.
+  const stopListening = onMembershipRevoked(({ roomId, userId }) => {
+    io.in(userKey(userId)).emit('removed_from_room', { roomId });
+    io.in(userKey(userId)).socketsLeave(roomKey(roomId));
+  });
+  httpServer.once('close', stopListening);
 
   io.on('connection', (socket) => {
     const { userId } = socket.data as AuthedSocketData;
@@ -99,6 +112,10 @@ export function attachSocketServer(httpServer: HttpServer): Server {
         return null;
       });
     (socket.data as AuthedSocketData).usernameReady = usernameReady;
+
+    // Every socket of this user joins one personal room, so the server can
+    // address "this person, on all their connections" (membership eviction).
+    void socket.join(userKey(userId));
 
     logger.info('socket connected', { userId, socketId: socket.id });
 

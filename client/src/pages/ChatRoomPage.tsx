@@ -290,6 +290,14 @@ export function ChatRoomPage() {
       );
     }
 
+    // The server evicted us from this room (our membership ended — e.g. we
+    // left from another tab). Pushes have already stopped; say so instead of
+    // leaving a chat that looks live but is silent.
+    function handleRemovedFromRoom(payload: { roomId: number }) {
+      if (payload.roomId !== roomId) return;
+      setError("You're no longer a member of this room.");
+    }
+
     socket.on('connect', handleConnect);
     socket.on('disconnect', handleDisconnect);
     socket.on('new_message', handleNewMessage);
@@ -300,6 +308,7 @@ export function ChatRoomPage() {
     socket.on('stopped_typing', handleStoppedTyping);
     socket.on('rate_limited', handleRateLimited);
     socket.on('error', handleSocketError);
+    socket.on('removed_from_room', handleRemovedFromRoom);
     // Already connected before this effect ran (e.g. navigating between
     // two rooms without ever losing the connection) — still passes
     // sinceSequence, same as handleConnect, since "already connected" says
@@ -321,6 +330,7 @@ export function ChatRoomPage() {
       socket.off('stopped_typing', handleStoppedTyping);
       socket.off('rate_limited', handleRateLimited);
       socket.off('error', handleSocketError);
+      socket.off('removed_from_room', handleRemovedFromRoom);
       if (rateLimitNoticeTimerRef.current) clearTimeout(rateLimitNoticeTimerRef.current);
       // Leaving the room (or this effect re-running for a different
       // roomId) should not leave an auto-clear timer running for a typing

@@ -239,6 +239,44 @@ displayed once" true: **delivery** can be retried freely because
 **persistence** is idempotent; the ack just tells the client it can stop
 retrying.
 
+### Membership is a cached "yes" — revocation must reach live sockets
+
+*(Added in Phase 16, after the integration suite found it missing.)*
+
+v1 asked "is this user still a member?" on every request, so leaving a room
+cut access on the very next poll. In v2 the question is asked **once**, at
+`join_room`; after that every push to `room:7` is a cached "yes" held in
+Socket.IO's room table. An HTTP `POST /rooms/7/leave` deleted the database row
+but nothing touched that table, so the ex-member kept receiving the room's
+messages, typing and presence until they happened to reconnect. Reproduced
+before the fix: Bob leaves, Alice sends "secret after bob left", Bob's socket
+receives it.
+
+The fix has three parts, each closing a different hole:
+
+1. **Announce, don't import.** The leave route calls
+   `announceMembershipRevoked({ roomId, userId })` on a tiny in-process bus
+   (`realtime/membershipEvents.ts`); the socket layer subscribes. Dependencies
+   point inward (routes → bus ← sockets): the REST layer never imports a
+   transport.
+2. **Address a person, not a connection.** Every socket joins a personal room
+   `user:<id>` on connect. On revocation the server does
+   `io.in("user:<id>").socketsLeave("room:<roomId>")` — evicting *every* tab and
+   device at once without enumerating them — and tells them
+   (`removed_from_room`) so the UI can say why instead of going silently dead.
+3. **Re-check after the join.** `join_room` checks membership and then joins,
+   with awaits in between. A leave that lands in that gap runs its eviction
+   before the socket is in the room, so the eviction finds nothing to remove
+   and the join then succeeds: a zombie member with no database row. The
+   handler therefore verifies membership *again* after `socket.join` and backs
+   out if it's gone. Either the eviction sees the socket or the re-check sees
+   the missing row — there is no third case. (Joins are rare; one extra query
+   is cheap insurance on an authorization boundary.)
+
+The general lesson: any time a permission is checked once and then cached in a
+long-lived structure, ask what *invalidates* the cache. The check is the easy
+half.
+
 ## 6. Reconnection: Backoff + Offline Message Queue
 
 **Why exponential backoff, not fixed-interval retry.** If a server
@@ -717,6 +755,13 @@ swap, and `BucketStore` is the seam.
   oversight: the moment a second instance is genuinely needed, this is
   the specific, well-documented gap to close first, before anything else
   breaks in more confusing ways.
+- **Cross-instance membership eviction.** The revocation bus above is
+  process-local, like presence and room fan-out. With a second instance behind
+  the Redis adapter, `io.in(...).socketsLeave(...)` already fans out across
+  instances, but the *announcement* must reach whichever instance holds the
+  user's sockets — it has to travel over the same shared layer (a Redis
+  channel, or Postgres `LISTEN/NOTIFY` on the membership table), not an
+  in-memory `EventEmitter`.
 - **Read receipts.** A natural v3 candidate (per-message "seen by" state,
   another place idempotency and ordering matter) but out of scope here to
   keep this phase focused on transport correctness, not feature breadth.
@@ -730,7 +775,7 @@ port — fine for HTTP, useless for sockets, where the connection **is** the
 thing under test. v2's suite binds the real Express + Socket.IO stack to an
 ephemeral port and drives it with `socket.io-client` as a genuine client,
 against the same PGlite-backed database v1 built. `cd server && npm test`
-runs all of it in one command (17 files, 89 tests, ~55s).
+runs all of it in one command (18 files, 94 tests, ~1 minute).
 
 ### The harness (`server/tests/helpers/realtimeHarness.ts`)
 
@@ -772,6 +817,7 @@ runs all of it in one command (17 files, 89 tests, ~55s).
 | `realtime.messaging` | handshake auth (no/garbage token refused, no server socket created); polling → WebSocket upgrade; ack to sender + push to others with the same row and consecutive sequences; non-members refused on join *and* send, and hear nothing; typing relayed, never echoed, refused for an unjoined room |
 | `realtime.replay` | **reconnect-and-replay, exactly once.** A resent id returns the *original* row; a message cut mid-flight at 0/3/10/30 ms lands exactly once whichever side of the commit the cut fell on; five messages queued offline replay in order on reconnect, once each, even when the flush runs twice (a reconnect storm) |
 | `realtime.catchup` | **catch-up correctness.** A 120-message gap arrives complete, ordered, in exactly three pages with no duplicates, then live delivery resumes; a dropped client receives exactly what it missed; **a message committed between the catch-up query and the join is not lost** (the seam, §7); live pushes interleaved with a multi-page catch-up never make the client skip a page; bad cursors → `VALIDATION_ERROR`; non-members get no batch; other rooms never leak |
+| `realtime.membership` | **revocation reaches live sockets.** After `POST /leave` the leaver receives no further messages/typing and can't speak into the room from a stale socket; *every* tab is evicted and only that user; their other rooms are untouched; rejoining restores delivery; and a join that **races** a leave (opened deterministically between the membership check and the join) does not leave a zombie member |
 | `realtime.presence` | **reference counting.** Two sockets, one user: online once; closing one changes nothing; closing the last goes offline only after the grace period. A reconnect inside the grace period broadcasts *nothing*. A silently dead connection (proxy blackhole) is detected by heartbeat (`ping timeout`) and then goes offline. Presence reaches only people sharing a room |
 | `realtime.ratelimit` | a flood gets **one** `rate_limited` notice, the connection survives, refused sends never reach the database, and the advertised `retryAfterSeconds` is honest; the budget belongs to the *user* (a second tab gets no fresh allowance); HTTP and socket spend from one send budget |
 | `realtime.reauth` | the real client lifecycle refreshes and reauths **on the same socket**, outlives its original token and re-arms for the next one (one connect event, ever); a client that ignores the warning is disconnected at expiry and cannot return with that token; a reauth with another user's token → `FORBIDDEN` and drop; garbage → `UNAUTHORIZED` without killing a valid socket |
@@ -810,6 +856,8 @@ breaking the code they guard and watching the right test go red:
 | follow-up pages cursor from the high-water mark, not the page end | `catchup` interleave test (times out waiting for pages that were skipped) |
 | presence broadcasts offline when *any* socket leaves | `presence` reference-counting test |
 | rate-limit bucket keyed by socket instead of user | `ratelimit` per-user budget **and** HTTP/socket shared-budget tests |
+| revocation does not evict the user's sockets (`socketsLeave` removed) | `membership` leave and all-tabs tests |
+| no membership re-check after the join | `membership` race test |
 | a reauth that is acknowledged but does not re-arm the expiry timers | `reauth` same-socket survival test |
 | the insert ignores the client's `client_message_id` (idempotency defeated) | all three `replay` tests |
 | jitter turned off / delay cap changed | `reconnectionOptions` herd and schedule tests |
@@ -827,7 +875,8 @@ deployment*: `npm run smoke:live -- https://<your-api>` creates two throwaway
 accounts and a room and verifies, through the real proxy: the polling →
 WebSocket **upgrade**, pushed delivery with latency, typing, presence
 online/offline (the real 7s grace), idempotent resend, reconnect + exact
-catch-up, and that a flood gets `rate_limited` without a disconnect.
+catch-up, membership revocation (a user who leaves stops receiving at once),
+and that a flood gets `rate_limited` without a disconnect.
 `--watch-deploy` holds a connection open while you trigger a deploy and reports
 whether `server_shutdown` arrived — the only way to see, from the outside, that
 `SIGTERM` really reaches the Node process on the platform (§14).
@@ -982,6 +1031,12 @@ start`, so Phase 16's live smoke test should confirm it by finding
   same suite and fixed by extracting `CatchUpCursor`. The lesson worth
   carrying: the comment justifying the old order was *confidently* wrong, and
   only an adversarial test of the boundary, not review, exposed it.
+- The same suite found a **security** bug: an ex-member kept receiving a room's
+  messages in real time, because v2 moved the membership check from "every
+  request" to "once, at join" and nothing invalidated it on leave. Fixed with an
+  announce-and-evict bus and a post-join re-check (§5); the test that pins it
+  includes a deterministically opened join-vs-leave race, because the obvious
+  fix alone still leaves a window.
 - Presence uses reference counting with a grace period, not a boolean —
   handles multi-tab and avoids refresh-flicker, both real user behavior
   a naive implementation would get wrong on day one.

@@ -36,13 +36,14 @@ reasoning and the bugs found along the way), and the build plans
 | Dead connections | An app-level heartbeat detects a connection that died silently (no FIN, no RST) and cleans it up. |
 | Typing | Pure relay — zero database writes — with an auto-clear safety net on the receiver. |
 | Rate limiting | Per-user token buckets shared by HTTP and sockets. A refused event gets one `rate_limited` notice; the connection is never dropped. |
+| Authorization | Membership is checked at join *and* enforced on revocation: leaving a room evicts every one of that user's live sockets from it immediately, and a join racing a leave cannot slip through. |
 | Auth | Short-lived access token + rotating refresh token with reuse detection. A socket re-authenticates *on the same connection* before its token expires. |
 | Deploys | `SIGTERM` → clients are told (`server_shutdown`), reconnect immediately to the new instance, and replay what they missed. |
 
 ## Testing
 
 ```bash
-cd server && npm test      # 17 files, 89 tests, ~1 minute, nothing to install or start
+cd server && npm test      # 18 files, 94 tests, ~1 minute, nothing to install or start
 cd client && npm test      # 89 tests, a few seconds
 ```
 
@@ -61,7 +62,7 @@ exercises the real app two ways:
   join, live pushes interleaved with paging), presence reference counting and
   the grace period, heartbeat detection of a silently dead connection, rate
   limiting (per-user budget, one notice, no disconnect), reauth surviving token
-  expiry, and a full rolling-deploy shutdown. The client's backoff schedule is
+  expiry, membership revocation (an ex-member stops receiving immediately), and a full rolling-deploy shutdown. The client's backoff schedule is
   tested with fake timers against the real Socket.IO manager.
 
 What each suite proves, and the mutation checks showing the tests can actually

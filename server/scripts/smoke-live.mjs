@@ -21,6 +21,9 @@
  *   7. Reconnect + catch-up: B's connection is killed, A sends while B is
  *      gone, B reconnects by itself and receives exactly what it missed.
  *   8. Idempotent resend: re-sending a message id returns the original row.
+ *   9. Membership revocation: a user who LEAVES a room stops receiving its
+ *      messages immediately (v2 checks membership once, at join, so leaving
+ *      has to actively evict live sockets).
  *
  * It creates two throwaway accounts and one throwaway room on whatever server
  * you point it at — so run it against YOUR deployment, not someone else's.
@@ -258,14 +261,30 @@ async function main() {
   const got = batch ? batch.messages.map((m) => m.sequence_number) : [];
   check('bob auto-reconnected and caught up on exactly what he missed', JSON.stringify(got) === JSON.stringify(missed), `expected ${missed}, got ${got}`);
 
-  section('8. Rate limiting (alice floods; the connection must survive)');
+  section('8. Membership revocation (carol leaves; she must stop hearing the room at once)');
+  const carol = await registerFresh('c');
+  await http('POST', `/rooms/${roomId}/join`, { token: carol.token });
+  const c = new Client('carol', carol.token);
+  await c.connect();
+  await c.join(roomId);
+  await a.send(roomId, 'carol can hear this');
+  check('carol (a member) receives room messages', Boolean(await c.take('new_message', (m) => m.body === 'carol can hear this', 8000).catch(() => null)));
+  const left = await http('POST', `/rooms/${roomId}/leave`, { token: carol.token });
+  check('POST /leave -> 204', left.status === 204);
+  check('carol was told she was removed from the room', Boolean(await c.take('removed_from_room', (p) => p.roomId === roomId, 8000).catch(() => null)));
+  await a.send(roomId, 'carol must NOT hear this');
+  const leaked = await c.quiet('new_message', 1000);
+  check('carol receives nothing after leaving', leaked.length === 0, leaked.length ? `leaked: ${JSON.stringify(leaked.map((m) => m.body))}` : '');
+  c.close();
+
+  section('9. Rate limiting (alice floods; the connection must survive)');
   for (let i = 0; i < 14; i++) a.socket.emit('send_message', { roomId, body: `flood ${i}`, clientMessageId: randomUUID() });
   const limited = await a.take('rate_limited', (n) => n.event === 'send_message', 8000).catch(() => null);
   check('alice got a rate_limited notice', Boolean(limited), limited ? `retry after ${limited.retryAfterSeconds}s` : '');
   await sleep(500);
   check('alice is still connected (a rate limit is not a disconnect)', a.socket.connected);
 
-  section('9. Presence: offline (waits out the real grace period, ~7s)');
+  section('10. Presence: offline (waits out the real grace period, ~7s)');
   a.close();
   const offline = await b.take('presence', (p) => p.userId === alice.id && p.status === 'offline', 20_000).catch(() => null);
   check('bob saw alice go offline after she disconnected', Boolean(offline));
