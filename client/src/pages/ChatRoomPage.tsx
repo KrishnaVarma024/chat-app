@@ -387,6 +387,19 @@ export function ChatRoomPage() {
   }
 
   const typingNames = Array.from(typingUserIds).map(resolveDisplayName);
+  // Exercise B3: a plain comma-join scales badly past two or three names —
+  // "Alice, Bob, Carol, Dave, Erin are typing…" is already unreadable, and
+  // a room with dozens of members typing at once would make it worse, not
+  // better. Collapsing to a count past two names is the same tradeoff a
+  // notifications badge makes ("12 new messages", never listing all 12).
+  const typingSummary =
+    typingNames.length === 0
+      ? ''
+      : typingNames.length === 1
+        ? typingNames[0]
+        : typingNames.length === 2
+          ? `${typingNames[0]} and ${typingNames[1]}`
+          : `${typingNames.length} people`;
 
   if (isLoadingInitial) return <div className="boot-screen">Loading room…</div>;
 
@@ -416,7 +429,7 @@ export function ChatRoomPage() {
 
       {typingNames.length > 0 && (
         <p className="typing-indicator">
-          {typingNames.join(', ')} {typingNames.length === 1 ? 'is' : 'are'} typing…
+          {typingSummary} {typingNames.length === 1 ? 'is' : 'are'} typing…
         </p>
       )}
 
