@@ -4,6 +4,7 @@ import { env } from '../config/env';
 import { socketAuthMiddleware, type AuthedSocketData } from './socketAuth.middleware';
 import { registerRoomHandlers, roomKey, userKey } from './rooms.socket';
 import { onMembershipRevoked } from './membershipEvents';
+import { startMembershipSweep } from './membershipSweep';
 import { registerMessageHandlers } from './messages.socket';
 import { registerTypingHandlers } from './typing.socket';
 import { registerReauthHandlers } from './reauth.socket';
@@ -42,11 +43,19 @@ export function attachSocketServer(httpServer: HttpServer): Server {
   // why — otherwise a user who left (or was removed) keeps receiving the
   // room's messages, typing and presence until they happen to reconnect.
   // v1's polling re-checked on every request and never had this problem.
-  const stopListening = onMembershipRevoked(({ roomId, userId }) => {
+  const evict = ({ roomId, userId }: { roomId: number; userId: number }) => {
     io.in(userKey(userId)).emit('removed_from_room', { roomId });
     io.in(userKey(userId)).socketsLeave(roomKey(roomId));
+  };
+  const stopListening = onMembershipRevoked(evict);
+  // The announce above is an edge: it fires once, and if it is lost nothing
+  // repeats it. The sweep re-derives the truth from the database every N ms, so
+  // an ex-member's staleness is bounded whatever went wrong.
+  const stopSweep = startMembershipSweep(io, evict, env.membershipSweepIntervalMs);
+  httpServer.once('close', () => {
+    stopListening();
+    stopSweep();
   });
-  httpServer.once('close', stopListening);
 
   io.on('connection', (socket) => {
     const { userId } = socket.data as AuthedSocketData;

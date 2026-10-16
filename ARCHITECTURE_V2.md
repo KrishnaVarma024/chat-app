@@ -252,7 +252,7 @@ messages, typing and presence until they happened to reconnect. Reproduced
 before the fix: Bob leaves, Alice sends "secret after bob left", Bob's socket
 receives it.
 
-The fix has three parts, each closing a different hole:
+The fix has four parts, each closing a different hole:
 
 1. **Announce, don't import.** The leave route calls
    `announceMembershipRevoked({ roomId, userId })` on a tiny in-process bus
@@ -272,6 +272,24 @@ The fix has three parts, each closing a different hole:
    out if it's gone. Either the eviction sees the socket or the re-check sees
    the missing row — there is no third case. (Joins are rare; one extra query
    is cheap insurance on an authorization boundary.)
+4. **Reconcile, don't only announce.** The announce is an *edge*: it fires
+   once, and if it is lost — an exception between the `DELETE` and the
+   announce, or an instance dying in that window while *another* instance holds
+   the user's socket — nothing ever repeats it. `realtime/membershipSweep.ts`
+   is the level-triggered backstop (the shape of a Kubernetes controller: keep
+   asking "does reality match the database?" rather than trusting that you saw
+   every event). Every `MEMBERSHIP_SWEEP_INTERVAL_MS` (default 30s; `0`
+   disables) it takes the live `(room, user)` pairs from `io.fetchSockets()`,
+   anti-joins them against `room_members` in **one** query for the whole server
+   (measured: 5 queries in a 1.05s window with 5 live rooms and a 200ms
+   interval, nothing else touching the database), and evicts any pair with no
+   row — logging a `warn` each time, because a hit means the fast path
+   *failed* (that line is the alert; the sweep is the safety net, not the
+   plan). With the announce deliberately swallowed
+   (`realtime.membership.sweep`), the ex-member heard **every** message
+   forever without the sweep, and was evicted about 315 ms after leaving with a
+   200 ms interval. A *single* instance that dies needs no sweep: its sockets
+   die with it, and `join_room` re-checks the database when clients reconnect.
 
 The general lesson: any time a permission is checked once and then cached in a
 long-lived structure, ask what *invalidates* the cache. The check is the easy
@@ -428,23 +446,58 @@ second half of the correction.
 ### The client cursor (`client/src/realtime/catchUpCursor.ts`)
 
 "The highest `sequence_number` I have seen" is the obvious value to send as
-`sinceSequence`, and it is wrong the moment live pushes and catch-up pages
-interleave. The invariant the client actually needs is stronger:
+`sinceSequence`, and it is wrong the moment anything arrives out of order. The
+invariant the client actually needs is stronger:
 
 > every message with `sequence_number <= cursor` is already known.
 
-A catch-up page is a contiguous range, so advancing to its
-`latestSequenceNumber` preserves that. A live push is **one** message that
-may be far ahead; advancing to it while a multi-page catch-up is still in
-flight declares the whole range in between "known", and the next page request
-(or the next reconnect) skips it forever. So:
+So the cursor is a **contiguity watermark**, and only two kinds of input may
+move it:
 
-- live pushes and the acks of our own sends advance the cursor **only when no
-  catch-up is in flight**;
-- follow-up pages continue from the **previous page's own end**, never from
-  the overall high-water mark;
-- a disconnect mid-chain leaves the cursor where it was, so the reconnect
-  asks for the unfinished range again.
+- a **`catch_up` page** may *jump* it. The server's `SELECT … WHERE
+  sequence_number > since ORDER BY … LIMIT` is an authoritative statement about
+  the whole range `(since, latest]`, so advancing to `latestSequenceNumber` is
+  always valid;
+- a **live push** (or the ack of our own send) moves it only if it is exactly
+  `cursor + 1`, or completes a run that was waiting. Anything further ahead
+  waits in an `ahead` set - the message is still *shown*; `ahead` only decides
+  what the cursor may *claim* - and is released when the hole below it fills in
+  or a page covers it. A disconnect clears `ahead` (the reconnect's catch-up
+  refetches everything above the cursor anyway).
+
+Two earlier designs fell short, and the second is instructive. Phase 12 used
+"highest seen". Phase 16 first fixed that with a guard - live pushes do not
+move the cursor while a catch-up is in flight - which closes the race between a
+live push and a *multi-page catch-up* and passed every test written for it. It
+does not close the race between live pushes **themselves**: sequence numbers
+are assigned in commit order (the counter row's lock is held until commit), but
+the broadcast happens when the sender's handler resumes, and two handlers can
+resume in the opposite order. A client can be told `2` before `1`. Jump to `2`,
+lose the connection before `1`'s push lands, and the reconnect asks for
+"everything above 2": message `1` is gone for good. This was reproduced
+deterministically (`realtime.catchup.ordering`: a gate on the first
+`sendMessage` holds it between commit and broadcast) and found independently by
+the model-based test (`catchUpCursor.model.test.ts`: seeded random interleavings
+of appends, drops, pages and swapped pushes, with the invariant checked after
+**every** step - about a third of seeds break the old cursor, the shortest
+counterexample is seven steps). The watermark removes the class rather than
+patching the instance: there is no "unsafe input" left to guard against,
+because nothing but an authoritative page can move the cursor past a hole.
+
+Two things this deliberately did *not* need. **Stopping the sequence burn**
+(Phase 4: a duplicate retry commits its claimed number without using it) - the
+bug reproduces with no duplicates at all. A burned number does leave a permanent
+hole, and the watermark's answer is the conservative one: it stalls below it and
+the next `catch_up` (any reconnect) steps over it, at the price of re-fetching
+messages the client already has (deduped by `client_message_id`).
+`cursor.hasGap` exposes "a live message is waiting above a hole" for a page that
+wants to schedule a repair `join_room` sooner. **A refetch overlap** (`since =
+cursor - K`) is cheaper but is a guess about how far messages can be reordered;
+the watermark has no magic number. (If you do want gap-free numbers: the
+duplicate path ending in `ROLLBACK` instead of `COMMIT` gives them - checked
+against a real Postgres with 30 distinct ids and 30 concurrent duplicate
+retries, `COMMIT` leaves 30 holes and `ROLLBACK` leaves none. It reverses a
+documented Phase 4 trade-off, so it is not done here.)
 
 This is a dependency-free class (`CatchUpCursor`) precisely because it is the
 one piece of client logic whose bugs lose messages silently. It is unit-tested
@@ -458,7 +511,7 @@ more than one page of history piled up), the client immediately requests
 the next page with the same mechanism, exactly as v1's poll route did —
 catching up in a couple of round trips instead of ever silently dropping
 messages older than the last page fetched. (From the previous page's end —
-see the cursor rules below.)
+see the cursor rules above.)
 
 **Implementation note (Phase 12):** "the same mechanism" turned out to
 mean, literally, re-emitting `join_room` itself — not a second dedicated
@@ -479,16 +532,10 @@ after a network drop, or a follow-up page.
 
 **Known limits (deliberate, documented, not hidden).**
 
-- *Out-of-order live delivery.* Two senders' handlers can broadcast in a
-  different order than their commits. If a client receives `11` before `10`
-  and the connection drops in that instant, the cursor (`11`) skips `10`.
-  Closing this needs per-message gap detection, which the server's own
-  sequence counter makes harder than it looks: a duplicate retry *burns* a
-  sequence number (Phase 4: the counter commits even when the insert is a
-  no-op), so a "gap" in the sequence is not reliably a "missed message". The
-  honest fixes are to stop burning numbers on duplicates, or to have the
-  client always re-fetch a short overlap window below its cursor. Neither was
-  needed to meet this phase's done-when, so neither is built.
+- *A hole that never fills.* A sequence number burned by a duplicate retry
+  stalls the watermark until the next `catch_up` (above). Correctness is never
+  affected - the stall is in the safe direction - but a long session after a
+  burn re-fetches (and dedupes) some messages on its next reconnect.
 - *A throw after the join.* If the catch-up query fails after `socket.join`,
   the client receives an `error` and has live delivery but no batch; the next
   reconnect repairs it. That is preferable to the reverse (a batch, but no
@@ -755,13 +802,35 @@ swap, and `BucketStore` is the seam.
   oversight: the moment a second instance is genuinely needed, this is
   the specific, well-documented gap to close first, before anything else
   breaks in more confusing ways.
-- **Cross-instance membership eviction.** The revocation bus above is
-  process-local, like presence and room fan-out. With a second instance behind
-  the Redis adapter, `io.in(...).socketsLeave(...)` already fans out across
-  instances, but the *announcement* must reach whichever instance holds the
-  user's sockets — it has to travel over the same shared layer (a Redis
-  channel, or Postgres `LISTEN/NOTIFY` on the membership table), not an
-  in-memory `EventEmitter`.
+- **Cross-instance membership eviction.** The revocation bus is an in-process
+  `EventEmitter`, like presence and room fan-out. With a second instance behind
+  the Redis adapter the *normal* path still works: `io.in(...).socketsLeave(...)`
+  and `io.fetchSockets()` are adapter-aware (the Socket.IO docs: "they will work
+  across Socket.IO servers"), so the instance that served `POST /leave` evicts
+  the user's sockets wherever they are. What does not survive scaling out is a
+  **lost** announce - that instance dying between the `DELETE` and the announce
+  leaves every *other* instance's sockets holding a cached "yes". The
+  reconciliation sweep (§5) is what bounds that, and because `fetchSockets()` is
+  cluster-wide it covers every instance from any one of them (duplicate
+  evictions are harmless). A shared announcement channel (a Redis channel, or
+  Postgres `LISTEN/NOTIFY` on the membership table) would make the fast path
+  cross-instance too, but it would still be an edge - the sweep stays as the
+  backstop either way.
+- **Load-balancing a second instance.** Engine.IO keeps each session (`sid`) in
+  one process's memory, and a long-polling session - plus the polling →
+  WebSocket upgrade - is several requests carrying that `sid`. Spread them
+  across instances and the second lands on a process that never heard of it:
+  `400 {"code":1,"message":"Session ID unknown"}` (reproduced in
+  `realtime.multiinstance`: round-robin → `connect_error`; pinned → connects and
+  upgrades). The three options in the Socket.IO docs: sticky sessions (cookie
+  or IP hash at the balancer), disabling long-polling (`transports:
+  ['websocket']` - no sticky routing needed, at the cost of clients behind
+  networks that block WebSockets), or client-side balancing. Also: a proxy's
+  read timeout (nginx `proxy_read_timeout` defaults to 60s) must exceed
+  `pingInterval + pingTimeout` (here 25s + 20s = 45s), or it will cut idle
+  connections with a `transport close`. A free Render web service is a single
+  instance, so none of this can happen there today - which is exactly why it
+  would first appear in production, not in testing.
 - **Read receipts.** A natural v3 candidate (per-message "seen by" state,
   another place idempotency and ordering matter) but out of scope here to
   keep this phase focused on transport correctness, not feature breadth.
@@ -775,7 +844,9 @@ port — fine for HTTP, useless for sockets, where the connection **is** the
 thing under test. v2's suite binds the real Express + Socket.IO stack to an
 ephemeral port and drives it with `socket.io-client` as a genuine client,
 against the same PGlite-backed database v1 built. `cd server && npm test`
-runs all of it in one command (18 files, 94 tests, ~1 minute).
+runs all of it in one command (24 files, 107 tests, about a minute and a half;
+`npm run test:fast` runs the same files in parallel in about half a minute —
+see "Parallel files" below).
 
 ### The harness (`server/tests/helpers/realtimeHarness.ts`)
 
@@ -804,6 +875,15 @@ runs all of it in one command (18 files, 94 tests, ~1 minute).
   proves *heartbeat* detection), `cutAll()` (a connection that vanishes with
   no notice), and `setTarget()` (retarget new connections — a platform router
   shifting traffic to a new instance mid-deploy).
+  It also counts the bytes that crossed it (`proxy.bytes`), so a test can
+  assert how much a server *says*, not just what: the typing-flood test measures
+  the server's output to the flooder on the wire.
+- **`deferred()`** is a promise resolved from the outside - a *gate*. Wrapping
+  `server.repo.sendMessage` with `vi.spyOn(...).mockImplementationOnce` and a
+  gate freezes a handler at an exact point (after the `INSERT` commits, before
+  the ack/broadcast), which turns "sleep and hope the race lands" into a forced
+  interleaving. Three suites use it (`replay.interleave`, `catchup.ordering`,
+  and the earlier membership race).
 - **`DB_POOL_MAX=1`** for the test pool. PGlite serves one connection at a time,
   and a realtime test inherently overlaps queries (a connection's username
   lookup, its presence lookup, the client's first `join_room`). A pool of one
@@ -817,16 +897,45 @@ runs all of it in one command (18 files, 94 tests, ~1 minute).
 | `realtime.messaging` | handshake auth (no/garbage token refused, no server socket created); polling → WebSocket upgrade; ack to sender + push to others with the same row and consecutive sequences; non-members refused on join *and* send, and hear nothing; typing relayed, never echoed, refused for an unjoined room |
 | `realtime.replay` | **reconnect-and-replay, exactly once.** A resent id returns the *original* row; a message cut mid-flight at 0/3/10/30 ms lands exactly once whichever side of the commit the cut fell on; five messages queued offline replay in order on reconnect, once each, even when the flush runs twice (a reconnect storm) |
 | `realtime.catchup` | **catch-up correctness.** A 120-message gap arrives complete, ordered, in exactly three pages with no duplicates, then live delivery resumes; a dropped client receives exactly what it missed; **a message committed between the catch-up query and the join is not lost** (the seam, §7); live pushes interleaved with a multi-page catch-up never make the client skip a page; bad cursors → `VALIDATION_ERROR`; non-members get no batch; other rooms never leak |
+| `realtime.catchup.ordering` | **out-of-order live pushes.** Alice's message commits as seq 1 but is broadcast late (a gate); Bob's seq 2 overtakes it; Carol — driving the shipped cursor — drops between the two and must still end with both on reconnect (`[2]` vs `[1,2]` against the old cursor) |
 | `realtime.membership` | **revocation reaches live sockets.** After `POST /leave` the leaver receives no further messages/typing and can't speak into the room from a stale socket; *every* tab is evicted and only that user; their other rooms are untouched; rejoining restores delivery; and a join that **races** a leave (opened deterministically between the membership check and the join) does not leave a zombie member |
+| `realtime.membership.sweep` | **bounded staleness when the revocation signal is lost.** With the announce swallowed: no sweep → the ex-member hears everything, forever, and only a reconnect (refused by `join_room`) ends it; a 200 ms sweep → evicted ~315 ms after leaving and silent afterwards; cost → one query per tick for the whole server, none per room or per push |
 | `realtime.presence` | **reference counting.** Two sockets, one user: online once; closing one changes nothing; closing the last goes offline only after the grace period. A reconnect inside the grace period broadcasts *nothing*. A silently dead connection (proxy blackhole) is detected by heartbeat (`ping timeout`) and then goes offline. Presence reaches only people sharing a room |
 | `realtime.ratelimit` | a flood gets **one** `rate_limited` notice, the connection survives, refused sends never reach the database, and the advertised `retryAfterSeconds` is honest; the budget belongs to the *user* (a second tab gets no fresh allowance); HTTP and socket spend from one send budget |
+| `realtime.typing.flood` | 5,000 `typing_start` in ~2 s: ~14 accepted (burst 10 + 2/s refill), ≤ a few `rate_limited` notices, the connection survives, and the server sends the flooder back a few hundred bytes for ~185 KB received (measured on the wire). A notice on *every* refused event would be 4,987 notices / 334 KB — the server out-talking the attacker |
 | `realtime.reauth` | the real client lifecycle refreshes and reauths **on the same socket**, outlives its original token and re-arms for the next one (one connect event, ever); a client that ignores the warning is disconnected at expiry and cannot return with that token; a reauth with another user's token → `FORBIDDEN` and drop; garbage → `UNAUTHORIZED` without killing a valid socket |
 | `realtime.shutdown` | a rolling deploy: clients are told, reconnect **immediately** to the new instance (inside the configured backoff) and lose nothing; the contrast case (no notice) waits the full backoff yet still catches up; one mute client cannot hold shutdown past the ack timeout; `/health` is `503` and new connections are refused once draining starts |
+| `realtime.validation` | an invalid `send_message` (empty / over-long / missing body, non-UUID id) → `VALIDATION_ERROR` echoing the `clientMessageId`, **no row, no sequence number consumed** (validation runs before the transaction), nothing pushed to others |
+| `realtime.replay.interleave` | exactly-once, forced into each interleaving instead of swept: a cut *after* the commit but *before* the ack (the retry returns the same row; the burned number is asserted), and a cut before the DB work where the **retry overtakes the original** (the original, resumed later, collapses into the existing row) |
+| `realtime.multiinstance` | two real instances behind a proxy: round-robin → `connect_error`, the proxy sees `400 {"code":1,"message":"Session ID unknown"}` and the server's Engine.IO reports code 1; pinned routing → connects and upgrades with no errors |
 | `smokeLive.script` | runs `scripts/smoke-live.mjs` against a local server, so the production smoke script cannot rot between deploys |
 
-Client side (`cd client && npm test`): `catchUpCursor.test.ts` (the cursor
-invariants), `reconnectionOptions.test.ts` (below), plus the existing outbox,
+Client side (`cd client && npm test`, 99 tests): `catchUpCursor.test.ts` (the
+cursor invariants, including the watermark cases), `catchUpCursor.model.test.ts`
+(below), `reconnectionOptions.test.ts` (below), plus the existing outbox,
 typing, lifecycle and merge suites.
+
+### Model-based testing the cursor (`catchUpCursor.model.test.ts`)
+
+Example tests check the interleavings someone thought of; the cursor's bugs
+live in the ones nobody did. The test simulates a server (an append-only log,
+with optional burned sequence numbers) and one client's network (a FIFO of live
+pushes and catch-up batches, drops, a SELECT that runs *after* the join), drives
+the real `CatchUpCursor` with 3,000 seeded-random interleavings per
+configuration, and checks the invariant after **every** step ("every message
+`<= cursor` is known") plus a liveness property at the end (after a full
+reconnect the client holds the whole log). A failure prints its seed and exact
+step trace, so it replays. Configurations: gap-free numbers, burned numbers,
+page size 1 (maximal chaining), live pushes overtaking each other, and
+overtaking + burns + page size 2. Against the pre-watermark cursor the first
+three pass and the last two fail (about a third of seeds).
+
+One result worth recording: the old rule "a follow-up page continues from the
+previous page's end, not the high-water mark" was an *equivalent mutant* once
+the in-flight guard existed, and is still one under the watermark - the model
+and the server suite cannot tell the two apart, because both are correct. Two
+defences that are interchangeable are not wasted, but a mutation test cannot
+justify either of them.
 
 ### Deterministic backoff (`reconnectionOptions.test.ts`)
 
@@ -845,6 +954,16 @@ two clients disconnected at the same instant do not retry at the same instant
 `server_shutdown` notice makes the *first* retry immediate while the next one
 waits the normal (doubled) delay, with the configured delay restored.
 
+Which timer-advance call matters, and when: the shipped tests stub the
+network step with a *synchronous* callback, so they would pass with either
+`advanceTimersByTime` or `advanceTimersByTimeAsync`. A real `open()` reports
+back from a later microtask. One test stubs it that way
+(`queueMicrotask(() => cb(err))`): with the sync call it records `[1000]` and
+stops - the first timer fires, but the microtask that schedules the second never
+runs inside a synchronous advance - and with the async call it records the full
+schedule. The async flavour is the default for that reason, and the test is the
+guard that keeps it so.
+
 ### Does the suite catch what it claims to? (mutation checks)
 
 A test that has never been seen to fail proves little. These were verified by
@@ -853,7 +972,7 @@ breaking the code they guard and watching the right test go red:
 | Mutation | Test that caught it |
 |---|---|
 | join *after* the catch-up query (the Phase 12 order) | `catchup` seam test: `[1,2,3]` vs `[1,2,3,4]` |
-| follow-up pages cursor from the high-water mark, not the page end | `catchup` interleave test (times out waiting for pages that were skipped) |
+| follow-up pages cursor from the high-water mark, not the page end | caught under the Phase 16 guard-based cursor (the `catchup` interleave test timed out on skipped pages); **an equivalent mutant under the watermark** — correct either way, so no test can or should catch it |
 | presence broadcasts offline when *any* socket leaves | `presence` reference-counting test |
 | rate-limit bucket keyed by socket instead of user | `ratelimit` per-user budget **and** HTTP/socket shared-budget tests |
 | revocation does not evict the user's sockets (`socketsLeave` removed) | `membership` leave and all-tabs tests |
@@ -861,10 +980,49 @@ breaking the code they guard and watching the right test go red:
 | a reauth that is acknowledged but does not re-arm the expiry timers | `reauth` same-socket survival test |
 | the insert ignores the client's `client_message_id` (idempotency defeated) | all three `replay` tests |
 | jitter turned off / delay cap changed | `reconnectionOptions` herd and schedule tests |
+| live pushes advance the cursor regardless of catch-up state (guard removed) | `catchUpCursor.model` — counterexample at seed 1 |
+| the pre-watermark cursor ("newest seen unless catching up") | `catchup.ordering` (`[2]` vs `[1,2]`, 3 of 3 runs) and the two overtaking configurations of the model test |
+| `min(1)` relaxed to `min(0)` on the message body | `validation` empty-body case |
+| the sweep disabled | both `membership.sweep` eviction and cost tests |
+| a `rate_limited` notice on every refused event (throttle removed) | `typing.flood` (4,987 notices vs the bound of 4) |
+| `advanceTimersByTime` (sync) instead of `…Async` against an async `open()` | `reconnectionOptions` async-open test (`[1000]` vs the full schedule) |
 
 Not every test has been mutation-checked — the shutdown, typing and messaging
 suites have not — so treat the table as "these are proven to bite", not "the
 rest are proven not to".
+
+### Parallel files (`npm run test:fast`, opt-in)
+
+The default run is serial because PGlite serves one connection at a time:
+files in parallel against *one* database is the "Connection terminated
+unexpectedly" failure. Parallelism is therefore **one independent database per
+worker slot**, not many files on one: `globalSetup` starts `TEST_DB_COUNT`
+PGlite servers (ports 5544, 5545, …) and migrates each, and
+`tests/setup/perWorkerDb.ts` points a worker at its slot via `VITEST_POOL_ID`
+before the app's `env.ts` loads. With `TEST_PARALLEL` unset there is one
+database and the setup file is a no-op.
+
+Measured (4 cores; whole suite, 94 tests at the time; the final suite on the
+mounted workspace went 85.5 s → 28.4 s of vitest time, 24/24 files green twice):
+
+| Configuration | Vitest time | Wall (incl. DB start-up) |
+|---|---|---|
+| serial (default) | 56 s | 65 s |
+| 2 workers | 30–32 s | 40–41 s |
+| 3 workers | 23–24 s | 33 s |
+| 4 workers | 20–23 s | 30–33 s |
+| 4 workers pinned to 2 CPU cores | 23–25 s | 33–34 s |
+
+Zero failures in 12 full parallel runs. What it costs: ~10 s of fixed start-up (four
+PGlite instances plus four migrations); the floor is the longest single file
+(`reauth`, ~10 s) — more workers cannot beat it; all databases run in the vitest
+*main* process, so their CPU is one shared thread (workers stay free of it,
+which is why timing-sensitive tests did not degrade); fixed ports can collide
+on a shared CI machine; and timing margin shrinks under CPU contention (the
+2-core run shows ~25% more cumulative test time). Twelve clean runs is not a
+proof: before making it the default, soak it (e.g. 50 runs on the CI hardware).
+Parallelism does nothing for what PGlite cannot do either — real concurrency
+still needs a real Postgres.
 
 ### Production verification (`server/scripts/smoke-live.mjs`)
 
@@ -883,10 +1041,24 @@ whether `server_shutdown` arrived — the only way to see, from the outside, tha
 
 ### What this suite deliberately does not prove
 
-True concurrency (PGlite is single-connection; the `scripts/*-test.mjs`
-concurrency scripts cover that against a real Postgres), multiple server
-instances (§12), a real browser (the client logic is unit-tested; the DOM is
-not), and the production-scale heartbeat (25s + 20s) — the logic is identical
+True concurrency. PGlite is single-connection and the test pool is pinned to
+one connection (`DB_POOL_MAX=1`), which serializes transactions completely, so
+anything that needs two connections *cannot happen* here. Measured against a
+real Postgres: a naive "read the counter, add one, write it back" passes 50/50
+with a pool of one and loses 40 of 50 (`unique_violation`) with a pool of ten,
+and two transactions locking the same two rows in opposite order both commit
+with a pool of one but one dies with `deadlock detected` (`40P01`) with a pool
+of two. The `scripts/*-test.mjs` concurrency scripts cover those against a real
+Postgres. (A pool of one is *loud*, not blind, about the opposite bug: holding a
+checked-out client while awaiting a second `pool.query` — say, calling
+`checkRoomMembership` inside a transaction — deadlocks instantly with one
+connection, while a pool of ten hides it until ten requests are in flight at
+once and every client is held by a caller waiting for another.)
+
+Also not proven here: a multi-instance deployment end to end
+(`realtime.multiinstance` shows the load-balancing hazard, but nothing here runs
+a shared adapter; §12), a real browser (the client logic is unit-tested; the DOM
+is not), and the production-scale heartbeat (25s + 20s) — the logic is identical
 at a compressed clock, which is the point of making the values configurable.
 
 ## 14. Graceful Shutdown
@@ -1037,6 +1209,18 @@ start`, so Phase 16's live smoke test should confirm it by finding
   announce-and-evict bus and a post-join re-check (§5); the test that pins it
   includes a deterministically opened join-vs-leave race, because the obvious
   fix alone still leaves a window.
+- Fixing a bug at the instance you found can leave its class standing, and
+  the exercises after Phase 16 showed it twice. The cursor guard ("live pushes
+  don't move the cursor mid catch-up") closed the case the suite had found and
+  passed every test written for it, yet two live pushes arriving in the
+  opposite order to their commits still lost a message on a drop; the fix was
+  to change what the cursor *means* (a contiguity watermark, §7), not to add a
+  second guard. Likewise the membership announce was right and still an *edge*
+  that a crash or exception can lose; the answer was a level-triggered sweep
+  that re-derives the truth from the database (§5), kept as a backstop rather
+  than a replacement. In both cases a model or a gate - a random-interleaving
+  simulator, a handler frozen between commit and broadcast - found what review
+  and example tests did not.
 - Presence uses reference counting with a grace period, not a boolean —
   handles multi-tab and avoids refresh-flicker, both real user behavior
   a naive implementation would get wrong on day one.

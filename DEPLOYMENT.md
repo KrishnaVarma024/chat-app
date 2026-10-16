@@ -95,7 +95,13 @@ uses them:
   deployment can see this — that is what `npm run smoke:live` checks (below).
 - **Single instance only.** Presence and room fan-out live in one process's
   memory (ARCHITECTURE_V2 §12). Free services can't scale past one instance
-  anyway; if you ever pay for a second, add the Redis adapter first.
+  anyway. If you ever pay for a second: add the Redis adapter, **and** make the
+  routing sticky (or switch the client to `transports: ['websocket']`) —
+  Engine.IO keeps each session in one process's memory, so a polling session
+  or the upgrade request that lands on the other instance gets
+  `400 "Session ID unknown"` (`realtime.multiinstance` reproduces it). If you
+  front the API with your own nginx, `proxy_read_timeout` must exceed 45 s
+  (ping interval + timeout) or idle connections are cut with `transport close`.
 - **Heartbeat:** the server pings every 25s and drops a connection that
   doesn't answer within 20s (`SOCKET_PING_INTERVAL_MS` /
   `SOCKET_PING_TIMEOUT_MS`), which is also what keeps an idle connection from

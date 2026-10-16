@@ -35,6 +35,10 @@ export const env = {
   // would force anyway — instead of failing with "Connection terminated
   // unexpectedly". Production never sets this.
   dbPoolMax: Number(process.env.DB_POOL_MAX ?? 10),
+  // How often the membership reconciliation sweep runs (0 = off). It bounds how
+  // long an ex-member's still-connected socket can keep receiving pushes when the
+  // fast-path announce (membershipEvents.ts) is lost. See realtime/membershipSweep.ts.
+  membershipSweepIntervalMs: Number(process.env.MEMBERSHIP_SWEEP_INTERVAL_MS ?? 30_000),
 
   // Socket.IO's app-level heartbeat (ARCHITECTURE_V2.md §8). Overridable
   // via env, not hardcoded, for exactly one reason: verifying "a dead

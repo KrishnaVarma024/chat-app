@@ -31,20 +31,21 @@ reasoning and the bugs found along the way), and the build plans
 |---|---|
 | Delivery | `send_message` → `message_ack` to the sender, `new_message` pushed to the room. A stable `client_message_id` makes every resend idempotent: one row, however many times it is sent. |
 | Offline | The client queues unsent messages and replays them in order on reconnect; a rate-limited send stays queued and retries after the advertised delay. |
-| Catch-up | Every join carries the client's cursor; the server returns exactly what was missed (paged, so any gap size works). The server joins the live room *before* querying, so nothing can fall between history and live — see ARCHITECTURE_V2 §7 for the bug that taught this. |
+| Catch-up | Every join carries the client's cursor; the server returns exactly what was missed (paged, so any gap size works). The server joins the live room *before* querying, so nothing can fall between history and live, and the cursor is a contiguity watermark, so live pushes arriving out of order can't make it skip a message — see ARCHITECTURE_V2 §7 for the bugs that taught both. |
 | Presence | Reference-counted per user (two tabs = one person) with a grace period, so a page refresh never flickers anyone offline. |
 | Dead connections | An app-level heartbeat detects a connection that died silently (no FIN, no RST) and cleans it up. |
 | Typing | Pure relay — zero database writes — with an auto-clear safety net on the receiver. |
 | Rate limiting | Per-user token buckets shared by HTTP and sockets. A refused event gets one `rate_limited` notice; the connection is never dropped. |
-| Authorization | Membership is checked at join *and* enforced on revocation: leaving a room evicts every one of that user's live sockets from it immediately, and a join racing a leave cannot slip through. |
+| Authorization | Membership is checked at join *and* enforced on revocation: leaving a room evicts every one of that user's live sockets from it immediately, a join racing a leave cannot slip through, and a periodic sweep re-derives the truth from the database so even a lost revocation signal is bounded (default 30 s). |
 | Auth | Short-lived access token + rotating refresh token with reuse detection. A socket re-authenticates *on the same connection* before its token expires. |
 | Deploys | `SIGTERM` → clients are told (`server_shutdown`), reconnect immediately to the new instance, and replay what they missed. |
 
 ## Testing
 
 ```bash
-cd server && npm test      # 18 files, 94 tests, ~1 minute, nothing to install or start
-cd client && npm test      # 89 tests, a few seconds
+cd server && npm test      # 24 files, 107 tests, ~1.5 minutes, nothing to install or start
+cd server && npm run test:fast   # the same files in parallel (one in-memory DB per worker): ~30s on 4 cores
+cd client && npm test      # 99 tests, a few seconds
 ```
 
 `npm test` needs no Docker and no running server. It starts an in-memory
@@ -62,8 +63,14 @@ exercises the real app two ways:
   join, live pushes interleaved with paging), presence reference counting and
   the grace period, heartbeat detection of a silently dead connection, rate
   limiting (per-user budget, one notice, no disconnect), reauth surviving token
-  expiry, membership revocation (an ex-member stops receiving immediately), and a full rolling-deploy shutdown. The client's backoff schedule is
-  tested with fake timers against the real Socket.IO manager.
+  expiry, membership revocation (an ex-member stops receiving immediately, and
+  still does within one sweep interval when the revocation signal is lost),
+  out-of-order live pushes (the client cursor is a contiguity watermark), a
+  typing flood (the limiter must not out-talk the attacker), why two instances
+  need sticky routing, and a full rolling-deploy shutdown. The client's backoff
+  schedule is tested with fake timers against the real Socket.IO manager, and
+  the cursor with a model-based test that checks its invariant after every step
+  of thousands of seeded random interleavings.
 
 What each suite proves, and the mutation checks showing the tests can actually
 fail, are in [`ARCHITECTURE_V2.md` §13](./ARCHITECTURE_V2.md).
@@ -123,7 +130,8 @@ Socket.IO shares that port.
 Optional tuning (all have production-safe defaults; the test suite shortens
 them): `SOCKET_PING_INTERVAL_MS`, `SOCKET_PING_TIMEOUT_MS`,
 `PRESENCE_GRACE_PERIOD_MS`, `TOKEN_EXPIRY_WARNING_LEAD_MS`,
-`SHUTDOWN_ACK_TIMEOUT_MS`, `SHUTDOWN_HARD_TIMEOUT_MS`, `DB_POOL_MAX`.
+`SHUTDOWN_ACK_TIMEOUT_MS`, `SHUTDOWN_HARD_TIMEOUT_MS`, `DB_POOL_MAX`,
+`MEMBERSHIP_SWEEP_INTERVAL_MS` (0 turns the sweep off).
 
 ## Getting Started (client)
 
