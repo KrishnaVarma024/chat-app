@@ -79,6 +79,13 @@ export function registerReauthHandlers(_io: Server, socket: Socket): void {
     const msUntilWarning = msUntilExpiry - lead;
 
     warnTimer = setTimeout(() => {
+      // Same early-fire hazard as the expiry timer below: a delay clamped to
+      // the setTimeout ceiling fires long before the real warning time, and a
+      // premature `token_expiring` is a lie. Re-arm instead of emitting.
+      if (data.tokenExpiresAtMs - Date.now() - lead > 1_000) {
+        arm(data.tokenExpiresAtMs);
+        return;
+      }
       socket.emit('token_expiring', { expiresInMs: Math.max(0, data.tokenExpiresAtMs - Date.now()) });
     }, clampDelay(msUntilWarning));
 

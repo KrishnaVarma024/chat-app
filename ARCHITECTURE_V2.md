@@ -162,11 +162,15 @@ and a needless gap in delivery:
   still-rejected token cannot loop. If the in-place swap itself fails, the
   client falls back to a clean disconnect/connect; Phase 12's catch-up
   covers the gap.
-- **Cross-tab race (known, mitigated, not closed).** The refresh token
+- **Cross-tab race (closed in the Phase 15 exercises).** The refresh token
   rotates, so two tabs refreshing at the same instant look like reuse and
   revoke the whole family. In-tab single-flight (v1) doesn't help across
-  tabs; a 0–1.5s random delay before refreshing makes a collision unlikely.
-  Closing it properly needs `navigator.locks` / `BroadcastChannel`.
+  tabs. A 0–1.5s random delay before refreshing made a collision unlikely;
+  `api/client.ts` now also wraps the refresh in a Web Lock
+  (`navigator.locks`), so the second tab's request only leaves after the
+  first has rotated the cookie. `crossTabRefresh.test.ts` runs the real
+  module as two tabs against a rotating-token fake server: without the lock
+  the loser is told `dead` and the family is revoked; with it both succeed.
 
 `scripts/reauth-test.mjs` runs the *real* client module against a server
 started with `ACCESS_TOKEN_TTL=6s TOKEN_EXPIRY_WARNING_LEAD_MS=3000`:
@@ -177,10 +181,19 @@ the database holds. A control client that ignores `token_expiring` is
 warned ~2.5s before `exp` and force-disconnected at `exp` — the proof that
 the first result is the reauth working, not expiry being unenforced. It also
 covers the identity swap, the garbage token, and the expired-token
-handshake. (Writing it surfaced one thing worth knowing: `refreshAccessToken`
-returns `false` for *any* non-2xx, so a transient 5xx on refresh is treated
-like a dead session. The reconnect path still recovers, but it's a real
-gap — see the Phase 15 exercises.)
+handshake. (Writing it surfaced one gap, since closed: `refreshAccessToken` returned
+`false` for *any* non-2xx, so a transient 5xx on refresh was treated like a
+dead session — and cleared a perfectly good access token. It now returns
+`ok` / `dead` / `transient`; only 401/403 is `dead`, and a `transient`
+failure is retried with jittered exponential backoff for as long as the
+token has time left — the `token_expiring` payload's `expiresInMs` is the
+retry budget, not a fixed count. `reauth-transient-test.mjs` injects one
+failure: the three-way client keeps the same socket, the boolean control is
+force-closed at expiry and has to reconnect.) A `FORBIDDEN` reauth ack —
+another tab signed in as a different user and the shared cookie now mints
+*their* tokens — is reported through `onIdentityChanged` and deliberately
+**not** reconnected: reopening the socket would silently continue as the
+other user under the first user's UI.
 
 **Joining a room.** `join_room: { roomId }` → server runs the *same*
 membership check v1's `requireRoomMembership` does (refactored into a
@@ -581,7 +594,10 @@ things changed building it.
   `sendMessageStore`. Separate budgets per transport would hand a client
   double the rate by alternating between them. Full buckets are swept
   opportunistically inside `consume()` — no timer to leak, nothing to
-  unref, and idle users cost no memory after a minute.
+  unref. (Precisely: the sweep runs inside `consume()`, so memory is bounded
+  by users active within the last sweep interval — but if traffic stops
+  entirely nothing runs, and the map keeps its last size until the next
+  request from anyone. Bounded, not zero; proved in `rateLimit.exercises.test.ts`.)
 - **The limiter runs first in the handler**, before validation and the
   membership check (`socketRateLimit.ts`). A refused event should cost
   almost nothing, and if invalid payloads got an `error` reply for free, a
@@ -774,23 +790,25 @@ lands on a healthy server — the best case for the zero-first-delay retry —
 and the "connection accepted during the drain" gap above is close to moot,
 because new connections stopped arriving a minute ago.
 
-**Open production issue, found by experiment (fix belongs to Phase 16):**
-`render.yaml` starts the service with `npm run start`, and
-`package.json`'s `start` is `npm run migrate:up:prod && node dist/index.js`.
-That makes `npm` (and a `sh -c` for the `&&` chain) the process Render
-signals — and neither forwards `SIGTERM` to the `node` child. Reproduced in
-isolation (Node 22, npm 10): `SIGTERM` to `npm run <script>`, and to
-`sh -c 'a && node app.js'`, leaves the Node process running and its handler
-never fires; only `sh -c 'a && exec node app.js'` delivers it. Everything
-above was verified by launching `node` directly, which is *not* how it is
-launched in production, so as deployed today the Phase 15 shutdown path
-would be dead code and Render would fall back to `SIGKILL` after the
-shutdown delay. The fix has to make `node` the signalled process: run the
-migrations outside the start path (Render's `preDeployCommand` — not
-available on the free plan this project uses) or `exec` into node from a
-`startCommand` that bypasses `npm`. Phase 16's live smoke test should
-confirm it by looking for `shutdown initiated` in the *old* instance's logs
-after a deploy.
+**Production issue found by experiment, and its one-word fix (Phase 15
+exercise T1):** `render.yaml` starts the service with `npm run start`, and
+`start` was `npm run migrate:up:prod && node dist/index.js`. That makes `npm`
+and then an `sh -c` (for the `&&`) the processes Render signals, and neither
+forwards `SIGTERM` past its own direct child — so the Node handler above
+would never have run and Render would have fallen back to `SIGKILL` after
+the shutdown delay. Everything in this section had been verified by
+launching `node` directly, which is not how it is launched in production.
+`scripts/signal-forwarding-test.sh` starts the real server five ways and
+SIGTERMs whatever it launched: `npm run` of `a && node …` and `sh -c 'a &&
+node …'` leave the server running with the handler never fired; `sh -c 'a &&
+exec node …'`, `npm run` of `a && exec node …`, and plain `node …` all run
+it and stop cleanly. So the fix is `exec` in the `start` script (`exec`
+replaces the shell with node, making node npm's direct child, which npm does
+forward to), no change to `render.yaml`. Moving migrations to Render's
+`preDeployCommand` would also work but is not available on the free plan.
+Not verifiable from here: any wrapper Render itself puts around `npm run
+start`, so Phase 16's live smoke test should confirm it by finding
+`shutdown initiated` in the *old* instance's logs after a deploy.
 
 ## 15. What a Reviewer Should Notice
 

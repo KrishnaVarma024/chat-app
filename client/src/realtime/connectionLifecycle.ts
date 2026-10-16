@@ -18,11 +18,25 @@ import type { Socket } from 'socket.io-client';
  * timer, so a socket that is torn down (logout) leaves nothing behind.
  */
 
+/** See api/client.ts: ok / dead (401, session over) / transient (5xx, network). */
+export type RefreshOutcome = 'ok' | 'dead' | 'transient';
+
 export interface LifecycleDeps {
   /** Single-flight token refresh (api/client.ts). Resolves false when the
    * session is gone for good (cookie missing/revoked) — in which case the
    * app's own auth layer logs the user out and this module just stops. */
   refreshAccessToken: () => Promise<boolean>;
+  /** Preferred over `refreshAccessToken` when provided: distinguishes a dead
+   * session from a hiccup, so a transient failure is RETRIED (within the
+   * time left on the current token) instead of being treated as the end. */
+  refreshAccessTokenDetailed?: () => Promise<RefreshOutcome>;
+  /** The server refused `reauth` because the fresh token belongs to a
+   * DIFFERENT user than this socket was opened for (e.g. another tab logged
+   * in as someone else and the shared refresh cookie now mints their
+   * tokens). The socket is closed and is deliberately NOT reconnected: doing
+   * so would silently continue as the other user under the old user's UI.
+   * The app should reset (reload / log out). */
+  onIdentityChanged?: () => void;
   getAccessToken: () => string | null;
   /** Re-sends everything still queued in the outbox (outbox.ts). */
   flushOutbox: () => void;
@@ -39,6 +53,12 @@ export interface LifecycleOptions {
   /** Consecutive UNAUTHORIZED handshake rejections to recover from before
    * giving up. Default 3. */
   maxAuthRetries?: number;
+  /** First wait before retrying a transient refresh failure; doubles each
+   * time (500, 1000, 2000, ...), jittered. Default 500ms. */
+  refreshRetryBaseMs?: number;
+  /** Stop retrying this long before the token's expiry, leaving time for the
+   * reauth itself. Default 1000ms. */
+  refreshRetryMarginMs?: number;
   random?: () => number;
   now?: () => number;
 }
@@ -48,6 +68,8 @@ export function attachConnectionLifecycle(socket: Socket, deps: LifecycleDeps, o
   const reauthAckTimeoutMs = options.reauthAckTimeoutMs ?? 5000;
   const shutdownNoticeTtlMs = options.shutdownNoticeTtlMs ?? 30_000;
   const maxAuthRetries = options.maxAuthRetries ?? 3;
+  const refreshRetryBaseMs = options.refreshRetryBaseMs ?? 500;
+  const refreshRetryMarginMs = options.refreshRetryMarginMs ?? 1000;
   const random = options.random ?? Math.random;
   const now = options.now ?? Date.now;
 
@@ -67,6 +89,11 @@ export function attachConnectionLifecycle(socket: Socket, deps: LifecycleDeps, o
       }, ms);
       pendingTimers.add(t);
     });
+  }
+
+  async function refresh(): Promise<RefreshOutcome> {
+    if (deps.refreshAccessTokenDetailed) return deps.refreshAccessTokenDetailed();
+    return (await deps.refreshAccessToken()) ? 'ok' : 'dead';
   }
 
   // ---------------------------------------------------------------- §14
@@ -118,30 +145,55 @@ export function attachConnectionLifecycle(socket: Socket, deps: LifecycleDeps, o
    * TABS it doesn't — each tab has its own JS context, but they share one
    * cookie — and two tabs that connected at similar moments have similar
    * token expiry. A small random delay makes it unlikely they refresh in
-   * the same few milliseconds. (Actually closing the gap needs cross-tab
-   * coordination — navigator.locks or BroadcastChannel — which is out of
-   * scope here and called out in the exercises.)
+   * the same few milliseconds. The gap itself is closed one layer down:
+   * api/client.ts wraps the refresh in a cross-tab Web Lock, so the second
+   * tab's request only goes out after the first has rotated the cookie.
    */
-  function onTokenExpiring(): void {
+  function onTokenExpiring(payload?: { expiresInMs?: number }): void {
     if (reauthInFlight) return; // a second warning while one is being handled adds nothing
     reauthInFlight = true;
-    void reauthenticate().finally(() => {
+    void reauthenticate(payload?.expiresInMs).finally(() => {
       reauthInFlight = false;
     });
   }
 
-  async function reauthenticate(): Promise<void> {
+  async function reauthenticate(expiresInMs?: number): Promise<void> {
+    // The warning says how long this token has left. That is the whole
+    // budget for getting a new one: retrying past it is pointless, the
+    // server will have closed us by then (and the "token_expired" path
+    // below picks up from there).
+    const deadline = now() + (expiresInMs ?? 10_000);
+
     await sleep(random() * reauthJitterMaxMs);
     if (detached) return;
 
-    const refreshed = await deps.refreshAccessToken();
-    if (detached || !refreshed) return; // session gone: the auth layer handles logout
+    // Refresh, retrying TRANSIENT failures (5xx, network) with jittered
+    // exponential backoff for as long as the token has time left. A DEAD
+    // session (401) is not retried — nothing will fix it.
+    for (let attempt = 0; ; attempt++) {
+      const outcome = await refresh();
+      if (detached) return;
+      if (outcome === 'ok') break;
+      if (outcome === 'dead') return; // session gone: the auth layer handles logout
+
+      const wait = refreshRetryBaseMs * 2 ** attempt * (0.5 + random() / 2);
+      if (now() + wait >= deadline - refreshRetryMarginMs) return; // out of time
+      await sleep(wait);
+      if (detached) return;
+    }
 
     const token = deps.getAccessToken();
     if (!token) return;
 
     const result = await emitReauth(token);
     if (detached || result?.ok) return;
+
+    // A valid token for a DIFFERENT user. The server has already closed this
+    // socket; reconnecting would just reopen it as that other user.
+    if (result?.code === 'FORBIDDEN') {
+      deps.onIdentityChanged?.();
+      return;
+    }
 
     // The in-place swap failed (timed out, or the server refused it).
     // Fall back to the blunt instrument that always works: a clean
@@ -151,9 +203,9 @@ export function attachConnectionLifecycle(socket: Socket, deps: LifecycleDeps, o
     socket.connect();
   }
 
-  function emitReauth(token: string): Promise<{ ok: boolean } | null> {
+  function emitReauth(token: string): Promise<{ ok: boolean; code?: string } | null> {
     return new Promise((resolve) => {
-      socket.timeout(reauthAckTimeoutMs).emit('reauth', { token }, (err: Error | null, result: { ok: boolean }) => {
+      socket.timeout(reauthAckTimeoutMs).emit('reauth', { token }, (err: Error | null, result: { ok: boolean; code?: string }) => {
         resolve(err ? null : result);
       });
     });

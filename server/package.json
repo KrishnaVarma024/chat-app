@@ -11,7 +11,7 @@
     "migrate:up:prod": "node-pg-migrate up",
     "seed": "tsx src/db/seed.ts",
     "build": "tsc",
-    "start": "npm run migrate:up:prod && node dist/index.js",
+    "start": "npm run migrate:up:prod && exec node dist/index.js",
     "typecheck": "tsc --noEmit",
     "db:up": "docker compose up -d",
     "db:down": "docker compose down",
@@ -31,7 +31,9 @@
     "test:typing": "node scripts/typing-test.mjs",
     "test:ratelimit": "node scripts/ratelimit-test.mjs",
     "test:reauth": "node --import tsx scripts/reauth-test.mjs",
-    "test:shutdown": "node --import tsx scripts/shutdown-test.mjs"
+    "test:shutdown": "node --import tsx scripts/shutdown-test.mjs",
+    "test:reauth-transient": "node --import tsx scripts/reauth-transient-test.mjs",
+    "test:signals": "bash scripts/signal-forwarding-test.sh"
   },
   "dependencies": {
     "bcrypt": "^6.0.0",

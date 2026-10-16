@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { attachConnectionLifecycle, type LifecycleDeps } from './connectionLifecycle';
+import { attachConnectionLifecycle, type LifecycleDeps, type RefreshOutcome } from './connectionLifecycle';
 
 /**
  * A just-enough Socket and Manager. Everything connectionLifecycle.ts does
@@ -38,7 +38,7 @@ class FakeSocket {
   connectCalls = 0;
   disconnectCalls = 0;
   /** Decides how the "server" answers a reauth emit. */
-  reauthAnswer: (cb: (err: Error | null, result?: { ok: boolean }) => void) => void = (cb) => cb(null, { ok: true });
+  reauthAnswer: (cb: (err: Error | null, result?: { ok: boolean; code?: string }) => void) => void = (cb) => cb(null, { ok: true });
 
   on(event: string, fn: (...args: any[]) => void): this {
     if (!this.handlers.has(event)) this.handlers.set(event, new Set());
@@ -59,7 +59,7 @@ class FakeSocket {
   }
   timeout(_ms: number) {
     return {
-      emit: (event: string, payload: unknown, cb: (err: Error | null, result?: { ok: boolean }) => void) => {
+      emit: (event: string, payload: unknown, cb: (err: Error | null, result?: { ok: boolean; code?: string }) => void) => {
         this.emitted.push({ event, args: [payload] });
         this.reauthAnswer(cb);
       },
@@ -219,6 +219,115 @@ describe('token_expiring (mid-connection reauth)', () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(socket.disconnectCalls).toBe(1);
     expect(socket.connectCalls).toBe(1);
+  });
+});
+
+describe('Phase 15 exercise M3 — a reauth the server answers FORBIDDEN', () => {
+  it('reports an identity change and does NOT reconnect (that would silently continue as the other user)', async () => {
+    const onIdentityChanged = vi.fn();
+    const { socket } = setup({ onIdentityChanged });
+    socket.reauthAnswer = (cb) => cb(null, { ok: false, code: 'FORBIDDEN' });
+    socket.trigger('token_expiring', { expiresInMs: 5000 });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(onIdentityChanged).toHaveBeenCalledTimes(1);
+    expect(socket.connectCalls).toBe(0);
+    expect(socket.disconnectCalls).toBe(0);
+  });
+
+  it('UNAUTHORIZED is different: our token was bad, a fresh handshake can fix it, so fall back to disconnect + connect', async () => {
+    const onIdentityChanged = vi.fn();
+    const { socket } = setup({ onIdentityChanged });
+    socket.reauthAnswer = (cb) => cb(null, { ok: false, code: 'UNAUTHORIZED' });
+    socket.trigger('token_expiring', { expiresInMs: 5000 });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(onIdentityChanged).not.toHaveBeenCalled();
+    expect(socket.disconnectCalls).toBe(1);
+    expect(socket.connectCalls).toBe(1);
+  });
+});
+
+describe('Phase 15 exercise H3 — transient refresh failures are retried within the time the token has left', () => {
+  const sequence = (...outcomes: RefreshOutcome[]) => {
+    let i = 0;
+    return vi.fn(async (): Promise<RefreshOutcome> => outcomes[Math.min(i++, outcomes.length - 1)]);
+  };
+
+  it('one 500, then success: reauths in place, never reconnects', async () => {
+    const refreshAccessTokenDetailed = sequence('transient', 'ok');
+    const { socket } = setup({ refreshAccessTokenDetailed }, { refreshRetryBaseMs: 500 });
+    socket.trigger('token_expiring', { expiresInMs: 6000 });
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(refreshAccessTokenDetailed).toHaveBeenCalledTimes(1);
+    expect(socket.emitted).toHaveLength(0); // failed once, waiting to retry
+
+    await vi.advanceTimersByTimeAsync(1000); // base 500ms x jitter(0.5..1)
+    expect(refreshAccessTokenDetailed).toHaveBeenCalledTimes(2);
+    expect(socket.emitted).toEqual([{ event: 'reauth', args: [{ token: 'old-token' }] }]);
+    expect(socket.disconnectCalls + socket.connectCalls).toBe(0);
+  });
+
+  it('backs off exponentially between attempts (500, 1000, 2000 x jitter)', async () => {
+    const refreshAccessTokenDetailed = sequence('transient', 'transient', 'transient', 'ok');
+    // random() = 1 -> jitter factor exactly 1.0, so waits are 500, 1000, 2000
+    const { socket } = setup({ refreshAccessTokenDetailed }, { refreshRetryBaseMs: 500, random: () => 1, reauthJitterMaxMs: 0 });
+    socket.trigger('token_expiring', { expiresInMs: 60_000 });
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(refreshAccessTokenDetailed).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(499);
+    expect(refreshAccessTokenDetailed).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(refreshAccessTokenDetailed).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(refreshAccessTokenDetailed).toHaveBeenCalledTimes(3);
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(refreshAccessTokenDetailed).toHaveBeenCalledTimes(4);
+    expect(socket.emitted).toHaveLength(1);
+  });
+
+  it('the retry budget is the TIME LEFT, not a count: stops when the next wait would eat the safety margin', async () => {
+    const refreshAccessTokenDetailed = sequence('transient'); // fails forever
+    const { socket } = setup({ refreshAccessTokenDetailed }, { refreshRetryBaseMs: 500, refreshRetryMarginMs: 1000, random: () => 1, reauthJitterMaxMs: 0 });
+    socket.trigger('token_expiring', { expiresInMs: 3000 });
+
+    await vi.advanceTimersByTimeAsync(10_000);
+    // attempts at t=0, t=500 (wait 500), t=1500 (wait 1000); the next wait is 2000 -> 3500 >= 3000-1000: give up.
+    expect(refreshAccessTokenDetailed).toHaveBeenCalledTimes(3);
+    expect(socket.emitted).toHaveLength(0);
+    expect(vi.getTimerCount()).toBe(0);
+    // Giving up is NOT an error path: no disconnect. The server's hard expiry + the token_expired recovery take over.
+    expect(socket.disconnectCalls + socket.connectCalls).toBe(0);
+  });
+
+  it('a DEAD session (401) is not retried', async () => {
+    const refreshAccessTokenDetailed = sequence('dead');
+    const { socket } = setup({ refreshAccessTokenDetailed });
+    socket.trigger('token_expiring', { expiresInMs: 60_000 });
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(refreshAccessTokenDetailed).toHaveBeenCalledTimes(1);
+    expect(socket.emitted).toHaveLength(0);
+  });
+
+  it('detaching mid-backoff cancels the retry', async () => {
+    const refreshAccessTokenDetailed = sequence('transient', 'ok');
+    const { socket, detach } = setup({ refreshAccessTokenDetailed });
+    socket.trigger('token_expiring', { expiresInMs: 60_000 });
+    await vi.advanceTimersByTimeAsync(0);
+    detach();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(refreshAccessTokenDetailed).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('the old boolean contract still works when no detailed refresh is supplied (false = dead)', async () => {
+    const { socket, deps } = setup({ refreshAccessToken: vi.fn(async () => false) });
+    socket.trigger('token_expiring', { expiresInMs: 60_000 });
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(deps.refreshAccessToken).toHaveBeenCalledTimes(1);
+    expect(socket.emitted).toHaveLength(0);
   });
 });
 

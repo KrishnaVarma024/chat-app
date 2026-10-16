@@ -1,5 +1,5 @@
 import { io, type Socket } from 'socket.io-client';
-import { API_BASE, refreshAccessToken } from '../api/client';
+import { API_BASE, refreshAccessToken, refreshAccessTokenOutcome } from '../api/client';
 import { getAccessToken } from '../api/tokenStore';
 import { enqueueMessage, flushQueueOverSocket, removeFromQueue } from './outbox';
 import { attachConnectionLifecycle } from './connectionLifecycle';
@@ -61,6 +61,11 @@ export function connectSocket(): Socket {
   // CONNECTION, not of whichever room UI happens to be mounted.
   detachLifecycle = attachConnectionLifecycle(socket, {
     refreshAccessToken,
+    refreshAccessTokenDetailed: refreshAccessTokenOutcome,
+    // Another tab signed in as a different user and the shared refresh cookie
+    // now mints THEIR tokens. Reloading re-bootstraps auth from the cookie, so
+    // the whole UI (not just the socket) agrees on who is signed in.
+    onIdentityChanged: () => window.location.reload(),
     getAccessToken,
     flushOutbox: () => {
       if (socket) flushQueueOverSocket(socket);
