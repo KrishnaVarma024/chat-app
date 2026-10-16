@@ -57,6 +57,8 @@ export interface RealtimeServer {
   triggerShutdown(opts?: { ackTimeoutMs?: number; hardTimeoutMs?: number }): Promise<void>;
   /** The imported repo module, so a test can spy on it (module-instance-matched to THIS server). */
   repo: typeof import('../../src/db/messages.repo');
+  /** Likewise the membership check, for tests that need to open a race between "check" and "join". */
+  rooms: typeof import('../../src/rooms/rooms.middleware');
   close(): Promise<void>;
 }
 
@@ -89,6 +91,7 @@ export async function startRealtimeServer(opts: StartOptions = {}): Promise<Real
     pool: typeof import('../../src/db/pool');
     shutdown: typeof import('../../src/lifecycle/shutdown');
     repo: typeof import('../../src/db/messages.repo');
+    rooms: typeof import('../../src/rooms/rooms.middleware');
   };
   try {
     vi.resetModules();
@@ -98,7 +101,8 @@ export async function startRealtimeServer(opts: StartOptions = {}): Promise<Real
     const pool = await import('../../src/db/pool');
     const shutdown = await import('../../src/lifecycle/shutdown');
     const repo = await import('../../src/db/messages.repo');
-    mods = { app, socket, pool, shutdown, repo };
+    const rooms = await import('../../src/rooms/rooms.middleware');
+    mods = { app, socket, pool, shutdown, repo, rooms };
   } finally {
     // The graph has captured what it needs; leave process.env as we found it
     // so one file's overrides never bleed into the next.
@@ -130,6 +134,7 @@ export async function startRealtimeServer(opts: StartOptions = {}): Promise<Real
     disconnects,
     exitCodes,
     repo: mods.repo,
+    rooms: mods.rooms,
     query: (sql, params) => mods.pool.pool.query(sql, params as any[]),
     async seedMessages(roomId, senderId, count, prefix = 'seed') {
       const sequences: number[] = [];

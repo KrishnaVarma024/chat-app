@@ -22,6 +22,7 @@ import { ValidationError, NotFoundError } from '../errors';
 import { createRateLimitMiddleware } from '../rateLimit/rateLimit.middleware';
 import { sendMessageStore, pollMessagesStore } from '../rateLimit/limits';
 import { sendMessageSchema } from './messages.validation';
+import { announceMembershipRevoked } from '../realtime/membershipEvents';
 
 export const roomsRouter = Router();
 
@@ -96,6 +97,11 @@ roomsRouter.post('/:roomId/join', async (req: AuthedRequest, res, next) => {
 roomsRouter.post('/:roomId/leave', requireRoomMembership, async (req: RoomScopedRequest, res, next) => {
   try {
     await removeRoomMember(req.roomId!, req.user!.id);
+    // The database row is the source of truth, but any socket this user
+    // already has in the room is a cached "yes" from join time. Tell the
+    // socket layer the membership ended so it can evict them — see
+    // realtime/membershipEvents.ts.
+    announceMembershipRevoked({ roomId: req.roomId!, userId: req.user!.id });
     res.status(204).send();
   } catch (err) {
     next(err);
