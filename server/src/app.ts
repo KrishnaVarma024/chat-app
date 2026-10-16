@@ -8,6 +8,7 @@ import { roomsRouter } from './rooms/rooms.routes';
 import { errorHandler, NotFoundError } from './errors';
 import { requestId } from './observability/requestId';
 import { requestLogger } from './observability/requestLogger';
+import { isShuttingDown } from './lifecycle/shutdownState';
 
 export function createApp() {
   const app = express();
@@ -28,7 +29,14 @@ export function createApp() {
   // cookie's contents directly, only using it as a lookup key into the DB.
   app.use(cookieParser());
 
-  app.get('/health', (_req, res) => res.json({ ok: true }));
+  // Flips to 503 the moment SIGTERM arrives (lifecycle/shutdown.ts), so a
+  // load balancer or orchestrator probing this endpoint stops routing new
+  // traffic here while the process drains. A health check that stays green
+  // while the process is shutting down is a health check that lies.
+  app.get('/health', (_req, res) => {
+    if (isShuttingDown()) return res.status(503).json({ ok: false, shuttingDown: true });
+    res.json({ ok: true });
+  });
 
   app.use('/auth', authRouter);
   app.use('/users', usersRouter);

@@ -43,6 +43,16 @@ export class TokenBucket {
     return true;
   }
 
+  /** True once the bucket has refilled all the way to `capacity` — at that
+   * point it is indistinguishable from a brand-new bucket, which is exactly
+   * what makes it safe for a store to throw it away (see bucketStore.ts's
+   * sweep): forgetting a full bucket loses no information, because the
+   * next request for that key would just construct an identical one. */
+  isFull(): boolean {
+    this.refill();
+    return this.tokens >= this.capacity;
+  }
+
   /** How long (seconds, rounded up) until at least 1 token is available —
    * used to set the Retry-After header on a 429 so a well-behaved caller
    * knows exactly when to try again instead of guessing/polling harder. */

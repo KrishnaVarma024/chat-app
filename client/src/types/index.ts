@@ -95,3 +95,24 @@ export interface TypingEvent {
   userId: number;
   roomId: number;
 }
+
+// Phase 15 — ARCHITECTURE_V2.md §11. Sent to ONE socket (never broadcast)
+// when an event it emitted was refused by the server's token bucket. It
+// describes the socket's remaining BUDGET, not any individual event's fate:
+// a refused send_message is not a definitive failure — it stays in the
+// outbox and is retried after `retryAfterSeconds`. The server throttles
+// these notices itself (at most one per event type per window), so a
+// client never needs to de-dupe a storm of them.
+export interface RateLimitedEvent {
+  event: string;
+  retryAfterSeconds: number;
+}
+
+// What the server answers to a `reauth` emit (Phase 15 — ARCHITECTURE_V2.md
+// §4). `FORBIDDEN` means the token was valid but for a different user; the
+// server closes the socket in that case.
+export interface ReauthResult {
+  ok: boolean;
+  expiresInMs?: number;
+  code?: 'UNAUTHORIZED' | 'FORBIDDEN';
+}

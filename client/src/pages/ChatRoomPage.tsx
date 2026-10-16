@@ -17,7 +17,16 @@ import { createTypingTracker } from '../realtime/typingTracker';
 import { MessageItem } from '../components/MessageItem';
 import { MessageInput } from '../components/MessageInput';
 import { ApiError } from '../api/client';
-import type { CatchUpBatch, DisplayMessage, Message, OptimisticMessage, PresenceEvent, Room, TypingEvent } from '../types';
+import type {
+  CatchUpBatch,
+  DisplayMessage,
+  Message,
+  OptimisticMessage,
+  PresenceEvent,
+  RateLimitedEvent,
+  Room,
+  TypingEvent,
+} from '../types';
 
 // ARCHITECTURE_V2.md §10's receiving-client safety net: auto-clear a
 // user's typing indicator if no FURTHER typing_start arrives within this
@@ -61,6 +70,13 @@ export function ChatRoomPage() {
   const [isLoadingInitial, setIsLoadingInitial] = useState(true);
   const [isLoadingOlder, setIsLoadingOlder] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Phase 15 — shown while the server is telling this client to slow down.
+  // Purely informational: the retry itself is connectionLifecycle.ts's job
+  // (the refused messages are still in the outbox and get re-flushed on
+  // their own), so nothing here needs to do anything but explain why
+  // "Sending…" is taking a moment.
+  const [rateLimitNotice, setRateLimitNotice] = useState<string | null>(null);
+  const rateLimitNoticeTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
   const containerRef = useRef<HTMLDivElement>(null);
   // Set right before a state update that needs a specific scroll reaction
@@ -249,6 +265,15 @@ export function ChatRoomPage() {
       typingTrackerRef.current.markStopped(typingUserId);
     }
 
+    function handleRateLimited({ event, retryAfterSeconds }: RateLimitedEvent) {
+      // Typing notices are deliberately invisible: a throttled typing
+      // indicator isn't worth telling the user about.
+      if (event !== 'send_message') return;
+      setRateLimitNotice(`You're sending messages too quickly. Retrying automatically in ${retryAfterSeconds}s…`);
+      if (rateLimitNoticeTimerRef.current) clearTimeout(rateLimitNoticeTimerRef.current);
+      rateLimitNoticeTimerRef.current = setTimeout(() => setRateLimitNotice(null), retryAfterSeconds * 1000 + 200);
+    }
+
     function handleSocketError(data: { error?: { code?: string; message?: string }; clientMessageId?: string }) {
       // Room-level errors (a bad join_room) don't carry a clientMessageId —
       // nothing to reconcile here, just a send_message failure.
@@ -268,6 +293,7 @@ export function ChatRoomPage() {
     socket.on('presence', handlePresence);
     socket.on('typing', handleTyping);
     socket.on('stopped_typing', handleStoppedTyping);
+    socket.on('rate_limited', handleRateLimited);
     socket.on('error', handleSocketError);
     // Already connected before this effect ran (e.g. navigating between
     // two rooms without ever losing the connection) — still passes
@@ -288,7 +314,9 @@ export function ChatRoomPage() {
       socket.off('presence', handlePresence);
       socket.off('typing', handleTyping);
       socket.off('stopped_typing', handleStoppedTyping);
+      socket.off('rate_limited', handleRateLimited);
       socket.off('error', handleSocketError);
+      if (rateLimitNoticeTimerRef.current) clearTimeout(rateLimitNoticeTimerRef.current);
       // Leaving the room (or this effect re-running for a different
       // roomId) should not leave an auto-clear timer running for a typing
       // indicator this component no longer renders — the reset at the top
@@ -412,6 +440,7 @@ export function ChatRoomPage() {
       </header>
 
       {error && <p className="form-error">{error}</p>}
+      {rateLimitNotice && <p className="form-error">{rateLimitNotice}</p>}
 
       <div className="message-list" ref={containerRef} onScroll={handleScroll}>
         {isLoadingOlder && <p className="loading-older">Loading older messages…</p>}

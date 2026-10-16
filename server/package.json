@@ -28,7 +28,10 @@
     "test:reconnect-queue": "node scripts/reconnect-queue-test.mjs",
     "test:catchup": "node scripts/catchup-test.mjs",
     "test:presence": "node scripts/presence-test.mjs",
-    "test:typing": "node scripts/typing-test.mjs"
+    "test:typing": "node scripts/typing-test.mjs",
+    "test:ratelimit": "node scripts/ratelimit-test.mjs",
+    "test:reauth": "node --import tsx scripts/reauth-test.mjs",
+    "test:shutdown": "node --import tsx scripts/shutdown-test.mjs"
   },
   "dependencies": {
     "bcrypt": "^6.0.0",

@@ -101,14 +101,35 @@ function waitForEvent(socket, eventName, timeoutMs = 5000) {
  * papering over it with a stagger delay, and this test doesn't need
  * concurrent sends to prove anything about catch-up correctness anyway. */
 function sendAndWaitForAck(socket, roomId, body) {
+  // Phase 15 note: send_message is now rate limited (burst 10, then 2/sec),
+  // and Test 2's 60-message gap is far past that. So this helper behaves
+  // like the real client's outbox does: on a `rate_limited` notice it waits
+  // the advertised delay and re-sends the SAME clientMessageId (idempotent —
+  // Phase 4 — so a retry can never create a duplicate). Before Phase 15 this
+  // helper never saw a refusal and didn't need to.
   return new Promise((resolve, reject) => {
     const clientMessageId = crypto.randomUUID();
-    const timer = setTimeout(() => reject(new Error('timed out waiting for message_ack')), 5000);
-    socket.once('message_ack', (msg) => {
-      clearTimeout(timer);
-      resolve(msg);
-    });
-    socket.emit('send_message', { roomId, body, clientMessageId });
+    let retryTimer;
+    const finish = (fn, value) => {
+      clearTimeout(deadline);
+      clearTimeout(retryTimer);
+      socket.off('message_ack', onAck);
+      socket.off('rate_limited', onRateLimited);
+      fn(value);
+    };
+    const deadline = setTimeout(() => finish(reject, new Error('timed out waiting for message_ack')), 15_000);
+    const emit = () => socket.emit('send_message', { roomId, body, clientMessageId });
+    const onAck = (msg) => {
+      if (msg.client_message_id === clientMessageId) finish(resolve, msg);
+    };
+    const onRateLimited = (notice) => {
+      if (notice.event !== 'send_message') return;
+      clearTimeout(retryTimer);
+      retryTimer = setTimeout(emit, notice.retryAfterSeconds * 1000 + 100);
+    };
+    socket.on('message_ack', onAck);
+    socket.on('rate_limited', onRateLimited);
+    emit();
   });
 }
 

@@ -41,4 +41,26 @@ export const env = {
   // proving "reconnect within the grace window broadcasts nothing" needs a
   // short window to run quickly, not the production value.
   presenceGracePeriodMs: Number(process.env.PRESENCE_GRACE_PERIOD_MS ?? 7_000),
+
+  // How long BEFORE an access token's `exp` the server tells a socket to
+  // reauthenticate (`token_expiring` — ARCHITECTURE_V2.md §4). Long enough
+  // for a refresh round trip plus retries to finish comfortably; reauth.socket.ts
+  // additionally never lets the warning land earlier than the midpoint of a
+  // token's remaining life, so a short-lived token can't put a client into a
+  // refresh loop. Overridable for the same reason as the heartbeat settings:
+  // proving "survives expiry mid-connection" for real means actually waiting
+  // out an expiry, and nobody wants a 15-minute test.
+  tokenExpiryWarningLeadMs: Number(process.env.TOKEN_EXPIRY_WARNING_LEAD_MS ?? 60_000),
+
+  // Graceful shutdown (ARCHITECTURE_V2.md §14). On SIGTERM the server tells
+  // every client `server_shutdown`, then waits for them to acknowledge it —
+  // but never longer than this, so one unresponsive client can't hold a
+  // deploy hostage. Deterministic ("everyone has heard, or 3s passed")
+  // instead of a guessed sleep.
+  shutdownAckTimeoutMs: Number(process.env.SHUTDOWN_ACK_TIMEOUT_MS ?? 3_000),
+  // Absolute ceiling on the whole shutdown sequence, after which the process
+  // exits non-zero regardless of what is still open. Must stay comfortably
+  // under the platform's own SIGKILL deadline (Render's default is 30s), or
+  // the platform picks the moment of death instead of this process.
+  shutdownHardTimeoutMs: Number(process.env.SHUTDOWN_HARD_TIMEOUT_MS ?? 10_000),
 };
