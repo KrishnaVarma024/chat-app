@@ -23,6 +23,19 @@ export const env = {
   // to be one exact, named origin, not a default-allow-everything.
   corsOrigin: process.env.CORS_ORIGIN ?? 'http://localhost:5173',
 
+  // Upper bound on simultaneous Postgres connections from this process.
+  // 10 is the production default (comfortably under a small managed
+  // Postgres's connection cap even with a couple of instances during a
+  // rolling deploy). Overridable for one reason: the test suite's database
+  // (PGlite — see tests/setup/globalSetup.ts) is a single-connection
+  // engine, and a realtime test inherently runs several queries at once (a
+  // connection's username lookup, its presence lookup, the client's first
+  // join_room). Pinning the test pool to ONE connection makes the pool
+  // itself serialize those queries — exactly what the database underneath
+  // would force anyway — instead of failing with "Connection terminated
+  // unexpectedly". Production never sets this.
+  dbPoolMax: Number(process.env.DB_POOL_MAX ?? 10),
+
   // Socket.IO's app-level heartbeat (ARCHITECTURE_V2.md §8). Overridable
   // via env, not hardcoded, for exactly one reason: verifying "a dead
   // connection is detected via heartbeat timeout, not left hanging" for

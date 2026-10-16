@@ -3,6 +3,7 @@ import { API_BASE, refreshAccessToken, refreshAccessTokenOutcome } from '../api/
 import { getAccessToken } from '../api/tokenStore';
 import { enqueueMessage, flushQueueOverSocket, removeFromQueue } from './outbox';
 import { attachConnectionLifecycle } from './connectionLifecycle';
+import { RECONNECTION_OPTIONS } from './reconnectionOptions';
 
 // Module-level singleton, same reasoning as tokenStore.ts: there is exactly
 // ONE socket connection for the whole app (not one per component that
@@ -31,11 +32,10 @@ export function connectSocket(): Socket {
     // Jitter (randomizationFactor) then spreads those retries across
     // CLIENTS too, not just across time for one client, so the herd never
     // forms even among clients that all disconnected at the same moment.
-    reconnection: true,
-    reconnectionDelay: 1000, // first retry ~1s after a disconnect
-    reconnectionDelayMax: 30000, // never wait longer than 30s between attempts
-    randomizationFactor: 0.5, // +/-50% jitter applied to every computed delay
-    reconnectionAttempts: Infinity, // a chat app shouldn't give up and force a manual refresh
+    // reconnection, reconnectionDelay (1s), reconnectionDelayMax (30s),
+    // randomizationFactor (0.5), reconnectionAttempts (Infinity) — see
+    // reconnectionOptions.ts for the numbers and the reasoning behind each.
+    ...RECONNECTION_OPTIONS,
   });
 
   // Registered once, here, at socket-creation time — NOT inside

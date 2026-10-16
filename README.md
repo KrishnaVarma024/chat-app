@@ -1,69 +1,97 @@
 # Chat App
 
-A polling-based chat backend (users, rooms, messages) built around
-messaging-delivery correctness rather than CRUD breadth: gap-free
-per-room sequence numbers, cursor/keyset pagination, and JWT
-refresh-token rotation with reuse detection.
+A real-time chat app (users, rooms, messages) built around
+**message-delivery correctness** rather than CRUD breadth: gap-free per-room
+sequence numbers, cursor (never offset) pagination, JWT refresh-token rotation
+with reuse detection — and, in v2, a Socket.IO transport on top that is
+designed to survive the things real networks do: dropped connections, silent
+network death, token expiry mid-conversation, and server restarts.
 
-**Live demo:** [chat-app-client-j5j9.onrender.com](https://chat-app-client-j5j9.onrender.com)
-(API: [chat-app-server-j0mr.onrender.com](https://chat-app-server-j0mr.onrender.com)/health)
-— register your own account, it's a real deploy, not a screenshot. Free-tier
-hosting, so the API cold-starts (~50s) if it's been idle; that's expected,
-not a bug. See [`DEPLOYMENT.md`](./DEPLOYMENT.md) for how it's deployed.
+v1 was a polling app (the client asked "anything new?" every few seconds). v2
+replaces the polling with a persistent connection. Nothing from v1 was
+thrown away: the sockets call the same functions the HTTP routes do, so
+authorization, idempotency and ordering have exactly one implementation.
 
-See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the system design and
-[`ROADMAP.md`](./ROADMAP.md) for the build plan.
+**Deployed on Render** (free tier, so the API cold-starts in about a minute
+after 15 idle minutes — expected, not a bug): client
+[chat-app-client-j5j9.onrender.com](https://chat-app-client-j5j9.onrender.com),
+API [chat-app-server-j0mr.onrender.com](https://chat-app-server-j0mr.onrender.com)/health.
+See [`DEPLOYMENT.md`](./DEPLOYMENT.md) — including the free-database expiry
+that can take a deployment down, and how to check it end to end with
+`npm run smoke:live`.
 
-## Status
+Design docs: [`ARCHITECTURE.md`](./ARCHITECTURE.md) (v1, still the foundation),
+[`ARCHITECTURE_V2.md`](./ARCHITECTURE_V2.md) (the real-time layer, with the
+reasoning and the bugs found along the way), and the build plans
+[`ROADMAP.md`](./ROADMAP.md) / [`ROADMAP_V2.md`](./ROADMAP_V2.md).
 
-All 8 phases complete and deployed: schema, register/login, refresh-token
-rotation with reuse detection, rooms & membership, atomic sequenced/idempotent
-message send, cursor pagination (poll + scrollback), the React frontend
-(auth, room list, polling chat view, infinite scroll, optimistic send),
-hardening (per-user token-bucket rate limiting on send/poll, request-id
-propagated through every log line for a request, a centralized error
-handler with a consistent `{ error: { code, message } }` shape, and zod
-input validation on every route), an automated integration test suite, and
-a live deploy (Postgres + API + static frontend). See `ROADMAP.md` for each
-phase's definition of done.
+## What v2 does
+
+| Concern | Behaviour |
+|---|---|
+| Delivery | `send_message` → `message_ack` to the sender, `new_message` pushed to the room. A stable `client_message_id` makes every resend idempotent: one row, however many times it is sent. |
+| Offline | The client queues unsent messages and replays them in order on reconnect; a rate-limited send stays queued and retries after the advertised delay. |
+| Catch-up | Every join carries the client's cursor; the server returns exactly what was missed (paged, so any gap size works). The server joins the live room *before* querying, so nothing can fall between history and live — see ARCHITECTURE_V2 §7 for the bug that taught this. |
+| Presence | Reference-counted per user (two tabs = one person) with a grace period, so a page refresh never flickers anyone offline. |
+| Dead connections | An app-level heartbeat detects a connection that died silently (no FIN, no RST) and cleans it up. |
+| Typing | Pure relay — zero database writes — with an auto-clear safety net on the receiver. |
+| Rate limiting | Per-user token buckets shared by HTTP and sockets. A refused event gets one `rate_limited` notice; the connection is never dropped. |
+| Auth | Short-lived access token + rotating refresh token with reuse detection. A socket re-authenticates *on the same connection* before its token expires. |
+| Deploys | `SIGTERM` → clients are told (`server_shutdown`), reconnect immediately to the new instance, and replay what they missed. |
 
 ## Testing
 
-`cd server && npm test` runs the full integration suite in one command —
-no Docker, no manual setup. It spins up an in-memory Postgres-protocol
-server (PGlite), runs the real migrations against it, and exercises the
-real app through every layer (routing, validation, auth, rate limiting,
-the database) via [supertest](https://github.com/ladjs/supertest). This
-covers register/login/refresh, **reuse detection** (replaying a rotated
-refresh token revokes the whole token family), room membership
-authorization, message send + idempotent retry, **cursor pagination**
-correctness (poll and scrollback), and the Phase 7 hardening behaviors
-(malformed JSON, validation errors, rate-limit 429s + `Retry-After`,
-request-id propagation).
+```bash
+cd server && npm test      # 17 files, 89 tests, ~1 minute, nothing to install or start
+cd client && npm test      # 89 tests, a few seconds
+```
 
-What it deliberately does **not** cover: true concurrent access. PGlite
-is architecturally single-connection, so it can't exercise a genuine race
-(this came up in nearly every phase of building this). The two scenarios
-that specifically need real concurrency — **contiguous sequence numbers
-under 50 simultaneous sends** and **pagination stability while inserts
-happen mid-scroll** — live as standalone scripts that run against a real
-Postgres instead:
+`npm test` needs no Docker and no running server. It starts an in-memory
+Postgres-protocol database (PGlite), runs the real migrations against it, and
+exercises the real app two ways:
+
+- **HTTP integration (v1)** via [supertest](https://github.com/ladjs/supertest):
+  register/login/refresh, **reuse detection** (replaying a rotated refresh token
+  revokes the whole family), membership authorization, idempotent send, cursor
+  pagination, validation, error shapes, rate-limit 429s.
+- **Real-time integration (v2)**: the Express + Socket.IO stack bound to a real
+  port and driven by `socket.io-client`. Covers reconnect-and-replay
+  (exactly-once, including a message cut at the instant of disconnect),
+  catch-up correctness (multi-page gaps, a message landing between query and
+  join, live pushes interleaved with paging), presence reference counting and
+  the grace period, heartbeat detection of a silently dead connection, rate
+  limiting (per-user budget, one notice, no disconnect), reauth surviving token
+  expiry, and a full rolling-deploy shutdown. The client's backoff schedule is
+  tested with fake timers against the real Socket.IO manager.
+
+What each suite proves, and the mutation checks showing the tests can actually
+fail, are in [`ARCHITECTURE_V2.md` §13](./ARCHITECTURE_V2.md).
+
+**Against a deployment** (the part local tests cannot cover — a real hosting
+proxy has to pass the WebSocket upgrade through):
+
+```bash
+cd server
+npm run smoke:live -- https://your-api.onrender.com
+npm run smoke:live -- https://your-api.onrender.com --watch-deploy   # then trigger a deploy
+```
+
+**What `npm test` deliberately does not cover:** true concurrency. PGlite is
+single-connection, so the scenarios that need real simultaneous load live as
+standalone scripts that run against a real Postgres:
 
 ```bash
 docker compose up -d && npm run migrate:up && npm run dev   # in one terminal
 npm run test:concurrency            # 50 concurrent sends -> gapless 1..50
-npm run test:scrollback-stability   # scrollback correctness under concurrent insert
+npm run test:scrollback-stability   # pagination correctness under concurrent insert
 npm run test:refresh-race           # concurrent refresh calls on the same token
 npm run test:register-race          # concurrent registration with the same email
 npm run test:leave-race             # concurrent /leave calls stay idempotent
 npm run test:hardening              # same hardening checks as `npm test`, against a live server
 ```
 
-This split — one command for correctness, a documented separate one for
-scenarios needing real infrastructure — is itself the honest answer, not
-a workaround: `npm test` proves the logic is right; the concurrency
-scripts prove it holds under real simultaneous load, which needs a real
-database to mean anything.
+One command for correctness, a documented second one for what needs real
+infrastructure — that split is the honest answer, not a workaround.
 
 ## Getting Started (server)
 
@@ -87,9 +115,14 @@ docker compose exec postgres psql -U chatapp -d chatapp -c '\dt'
 docker compose exec postgres psql -U chatapp -d chatapp -c 'select * from room_members;'
 ```
 
-You should see six tables and a `general` room with `alice` (owner) and
-`bob` (member). The API server listens on the port set in `server/.env`
-(default `4000`).
+You should see the tables and a `general` room with `alice` (owner) and `bob`
+(member). The API listens on the port in `server/.env` (default `4000`);
+Socket.IO shares that port.
+
+Optional tuning (all have production-safe defaults; the test suite shortens
+them): `SOCKET_PING_INTERVAL_MS`, `SOCKET_PING_TIMEOUT_MS`,
+`PRESENCE_GRACE_PERIOD_MS`, `TOKEN_EXPIRY_WARNING_LEAD_MS`,
+`SHUTDOWN_ACK_TIMEOUT_MS`, `SHUTDOWN_HARD_TIMEOUT_MS`, `DB_POOL_MAX`.
 
 ## Getting Started (client)
 
@@ -102,13 +135,16 @@ npm install
 npm run dev
 ```
 
-Open the printed `localhost:5173` URL. Register two different users in
-two browser windows (or one normal + one incognito, since sessions are
-per-browser-profile), join the same room from both, and send messages —
-each should appear in the other window within one poll interval.
+Open the printed `localhost:5173` URL. Register two users in two browser
+windows (one normal + one incognito, since sessions are per-browser-profile),
+join the same room from both, and send messages: they appear in the other
+window immediately, with typing indicators and online/offline presence. To
+watch the resilience, stop the server mid-conversation (messages queue and the
+UI says so), start it again (they send, in order, exactly once), or close one
+window and watch the other mark that user offline a few seconds later.
 
 ## Stack
 
-Node.js, TypeScript, Express, Postgres, React 19 + Vite + React Router.
-No ORM — raw SQL via `pg`, versioned through `node-pg-migrate`. See
-`ARCHITECTURE.md` for why.
+Node.js, TypeScript, Express, Socket.IO, Postgres, React 19 + Vite + React
+Router. No ORM — raw SQL via `pg`, versioned through `node-pg-migrate`. See
+`ARCHITECTURE.md` and `ARCHITECTURE_V2.md` for why.
